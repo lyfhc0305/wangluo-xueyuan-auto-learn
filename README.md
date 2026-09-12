@@ -28,11 +28,12 @@ node auto-learn.mjs
 | `node auto-learn.mjs --list` | 列出未选课程 |
 | `node auto-learn.mjs --diagnose` | 输出接口状态摘要，不输出完整用户资料 |
 | `node auto-learn.mjs --logout` | 退出并清理当前浏览器会话的 Cookie 和站点存储 |
-| `node auto-learn.mjs --reset-profile` | 删除当前会话目录，下次需重新登录 |
-| `node auto-learn.mjs --profile=account2` | 使用独立的浏览器会话 |
+| `node auto-learn.mjs --reset-profile` | 删除当前会话目录和记录文件，下次需重新登录 |
+| `node auto-learn.mjs --reset-state` | 只清除学习记录（保留登录），`failed` 标记太多想重学时用 |
+| `node auto-learn.mjs --profile=account2` | 使用独立的浏览器会话和记录文件（`state-account2-xxxxxx.json`，后缀哈希用于区分 `a/b` 与 `a_b` 这类同名） |
 | `node auto-learn.mjs --no-mute` | 开启播放声音 |
 
-多个会话使用独立的浏览器目录和记录文件（`--profile=account2` 会生成 `.chrome-profile-account2/` 和 `state-account2.json`）。浏览器窗口应保持打开；如网站提示人工操作，请按提示处理。
+多个会话使用独立的浏览器目录和记录文件（`--profile=account2` 会生成 `.chrome-profile-account2-xxxxxx/` 和 `state-account2-xxxxxx.json`，`xxxxxx` 为名称哈希）。从旧版升级时，若新路径不存在但旧的无哈希路径存在会自动迁移；之前共用 `state.json` 的老用户会看到一行提示，旧文件不会被删除。浏览器窗口应保持打开；如网站提示人工操作，请按提示处理。
 
 ## 隐私与分享
 

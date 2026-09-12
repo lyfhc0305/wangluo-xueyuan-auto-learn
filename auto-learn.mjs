@@ -23,7 +23,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
+import { execSync, execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer-core';
 
@@ -43,18 +44,27 @@ const optVal = (n, d) => {
 
 /**
  * 会话目录。默认 .chrome-profile;用 --profile=张三 可以给不同账号各建一个,
- * 两个账号的登录态互不干扰(注意 state.json 是共用的,记录的是"这台机器学过哪些课")。
+ * 两个账号的登录态互不干扰,学习记录(state-*.json)也是按 profile 隔离的。
  */
 const PROFILE_NAME = String(optVal('profile', '') || '').trim();
+// 净化后的名字会折叠(如 a/b、a:b、a_b 都会变成 a_b),再追加 6 位哈希区分。
+const PROFILE_SAFE = PROFILE_NAME.replace(/[\\/:*?"<>|]/g, '_');
+const PROFILE_HASH = PROFILE_NAME ? createHash('sha1').update(PROFILE_NAME, 'utf8').digest('hex').slice(0, 6) : '';
+const PROFILE_TAG = PROFILE_NAME ? `${PROFILE_SAFE}-${PROFILE_HASH}` : '';
 const PROFILE_DIR = PROFILE_NAME
-  ? path.join(ROOT, `.chrome-profile-${PROFILE_NAME.replace(/[\\/:*?"<>|]/g, '_')}`)
+  ? path.join(ROOT, `.chrome-profile-${PROFILE_TAG}`)
   : path.join(ROOT, '.chrome-profile');
 
 // 不同 --profile 共用 state.json 会串课(已选/失败记录互相污染)。
 // 默认 profile 沿用 state.json(兼容老用户)；命名 profile 用独立文件。
 const STATE_FILE = PROFILE_NAME
-  ? path.join(ROOT, `state-${PROFILE_NAME.replace(/[\\/:*?"<>|]/g, '_')}.json`)
+  ? path.join(ROOT, `state-${PROFILE_TAG}.json`)
   : path.join(ROOT, 'state.json');
+
+// 兼容上一版命名(无哈希后缀):.chrome-profile-<safe> / state-<safe>.json。
+// 升级后若新路径不存在但旧路径存在,会自动迁移并打日志。
+const LEGACY_PROFILE_DIR = PROFILE_NAME ? path.join(ROOT, `.chrome-profile-${PROFILE_SAFE}`) : null;
+const LEGACY_STATE_FILE = PROFILE_NAME ? path.join(ROOT, `state-${PROFILE_SAFE}.json`) : null;
 
 const DEFAULT_CONFIG = {
   username: '',
@@ -178,15 +188,22 @@ function findBrowser() {
 function killLeftoverChrome() {
   try {
     if (process.platform === 'win32') {
-      // -like 把 *?[] 当通配符，双引号 -Command 会展开 $，都要转义，
-      // 否则 --profile 带特殊字符时会误杀/误漏进程。
-      const esc = PROFILE_DIR.replace(/[`$"]/g, m => '`' + m)
-        .replace(/'/g, "''")
-        .replace(/([*?[\]])/g, '`$1');
-      const ps = `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -like '*${esc}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
-      execSync(`powershell -NoProfile -Command "${ps}"`, { stdio: 'ignore', timeout: 30000 });
+      // 路径走环境变量传入,匹配用 .Contains() 而不用 -like,
+      // 彻底绕开单引号/通配符/正则三层转义问题。单引号字符串里反引号
+      // 不是转义符,之前在 pattern 里插反引号反而会把匹配搞坏。
+      const ps = `$p = $env:LEARN_PROFILE_DIR; `
+        + `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | `
+        + `Where-Object { $_.CommandLine -and $_.CommandLine.Contains($p) } | `
+        + `ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
+      execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], {
+        stdio: 'ignore', timeout: 30000,
+        env: { ...process.env, LEARN_PROFILE_DIR: PROFILE_DIR },
+      });
     } else {
-      execSync(`pkill -f ${JSON.stringify(PROFILE_DIR)} || true`, { stdio: 'ignore', timeout: 30000, shell: '/bin/sh' });
+      // pkill -f 收的是 ERE 正则,路径里的 .[]()+ 等都要转义,
+      // 否则 a[1] 会误命中 a1 的进程。用参数数组避免 shell 注入。
+      const re = PROFILE_DIR.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      spawnSync('pkill', ['-f', re], { stdio: 'ignore', timeout: 30000 });
     }
     return true;
   } catch { return false; }
@@ -863,52 +880,87 @@ async function main() {
   if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
   const logFile = path.join(LOG_DIR, `run-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.log`);
 
-  if (hasFlag('reset-profile') && fs.existsSync(PROFILE_DIR)) {
-    fs.rmSync(PROFILE_DIR, { recursive: true, force: true });
-    console.log(`已清除会话目录(${path.basename(PROFILE_DIR)}),下次运行需要重新登录。`);
+  // --reset-profile 现在连记录文件一起清(之前只删会话目录,永久的 failed 标记清不掉);
+  // 只想重学、不想重登录用 --reset-state。
+  if (hasFlag('reset-profile')) {
+    if (fs.existsSync(PROFILE_DIR)) {
+      fs.rmSync(PROFILE_DIR, { recursive: true, force: true });
+      console.log(`已清除会话目录(${path.basename(PROFILE_DIR)}),下次运行需要重新登录。`);
+    }
+    if (fs.existsSync(STATE_FILE)) {
+      fs.rmSync(STATE_FILE, { force: true });
+      console.log(`已清除记录文件(${path.basename(STATE_FILE)})。`);
+    }
+  }
+  if (hasFlag('reset-state') && fs.existsSync(STATE_FILE)) {
+    fs.rmSync(STATE_FILE, { force: true });
+    console.log(`已清除记录文件(${path.basename(STATE_FILE)}),登录会话保留。`);
   }
 
-  const chromePath = findBrowser();
+  // 从无哈希旧命名迁移:新路径不存在但旧路径存在时自动搬家,避免重复登录/丢记录。
+  if (PROFILE_NAME) {
+    try {
+      if (LEGACY_PROFILE_DIR && LEGACY_PROFILE_DIR !== PROFILE_DIR
+        && !fs.existsSync(PROFILE_DIR) && fs.existsSync(LEGACY_PROFILE_DIR)) {
+        fs.renameSync(LEGACY_PROFILE_DIR, PROFILE_DIR);
+        console.log(`已迁移会话目录: ${path.basename(LEGACY_PROFILE_DIR)} → ${path.basename(PROFILE_DIR)}`);
+      }
+      if (LEGACY_STATE_FILE && LEGACY_STATE_FILE !== STATE_FILE
+        && !fs.existsSync(STATE_FILE) && fs.existsSync(LEGACY_STATE_FILE)) {
+        fs.copyFileSync(LEGACY_STATE_FILE, STATE_FILE);
+        console.log(`已迁移记录文件: ${path.basename(LEGACY_STATE_FILE)} → ${path.basename(STATE_FILE)}`);
+      } else if (!fs.existsSync(STATE_FILE) && !fs.existsSync(LEGACY_STATE_FILE)
+        && fs.existsSync(path.join(ROOT, 'state.json'))) {
+        // 之前所有 profile 共用 state.json 的老用户:旧文件还在,但本 profile 不会再读它。
+        console.log(`提示:检测到旧的共用 state.json,本 profile(--profile=${PROFILE_NAME})改用 ${path.basename(STATE_FILE)},旧文件已不再读取,如需沿用可手动复制。`);
+      }
+    } catch (e) {
+      console.log('迁移旧 profile 数据失败(不影响继续运行):' + e.message);
+    }
+  }
+
   logStream = fs.createWriteStream(logFile, { flags: 'a' });
   log('══════════════════════════════════════════════════════');
   log(' 河南干部网络学院 · 自动学习助手');
-  log(` 目标: ${cfg.targetCredit} 学时/学分${cfg.only ? `  仅处理课程 ${cfg.only}` : ''}${cfg.maxCoursesPerRun ? `  最多 ${cfg.maxCoursesPerRun} 门` : ''}`);
-  log(` 浏览器: ${chromePath}`);
+  log(` 目标: ${cfg.targetCredit} 学时/学分${cfg.only ? ` 仅处理课程 ${cfg.only}` : ''}${cfg.maxCoursesPerRun ? ` 最多 ${cfg.maxCoursesPerRun} 门` : ''}`);
   log(` 会话目录: ${path.basename(PROFILE_DIR)}${cfg.profileName ? `  (--profile=${cfg.profileName})` : ''}`);
   log(` 记录文件: ${path.basename(STATE_FILE)}`);
   log(` 日志: ${logFile}`);
   log('══════════════════════════════════════════════════════');
 
-  const launchOpts = {
-    executablePath: chromePath,
-    headless: false,
-    userDataDir: PROFILE_DIR,
-    defaultViewport: null,
-    ignoreDefaultArgs: ['--enable-automation'],
-    args: [
-      '--start-maximized',
-      '--autoplay-policy=no-user-gesture-required',
-      '--disable-blink-features=AutomationControlled',
-      '--disable-features=Translate,OptimizationHints',
-      ...(cfg.muteAudio ? ['--mute-audio'] : []),
-    ],
-  };
-
   let browser = null;
   try {
-    browser = await puppeteer.launch(launchOpts);
-  } catch (e) {
-    if (!/already running for/i.test(String(e.message))) throw e;
-    log('⚠ 检测到上次运行残留的浏览器仍占用配置目录,正在清理…');
-    killLeftoverChrome();
-    await sleep(3000);
-    browser = await puppeteer.launch(launchOpts);
-  }
+    const chromePath = findBrowser();
+    log(` 浏览器: ${chromePath}`);
+    const launchOpts = {
+      executablePath: chromePath,
+      headless: false,
+      userDataDir: PROFILE_DIR,
+      defaultViewport: null,
+      ignoreDefaultArgs: ['--enable-automation'],
+      args: [
+        '--start-maximized',
+        '--autoplay-policy=no-user-gesture-required',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=Translate,OptimizationHints',
+        ...(cfg.muteAudio ? ['--mute-audio'] : []),
+      ],
+    };
 
-  const state = loadState();
-  state.courses = state.courses || {};
+    try {
+      browser = await puppeteer.launch(launchOpts);
+    } catch (e) {
+      if (!/already running for/i.test(String(e.message))) throw e;
+      log('⚠ 检测到上次运行残留的浏览器仍占用配置目录,正在清理…');
+      killLeftoverChrome();
+      await sleep(3000);
+      // 若第二次仍抛 already running,直接进外层 catch 打日志退出,不再静默崩溃。
+      browser = await puppeteer.launch(launchOpts);
+    }
 
-  try {
+    const state = loadState();
+    state.courses = state.courses || {};
+
     const page = (await browser.pages())[0] || await browser.newPage();
     await preparePage(page, cfg);
     // --logout: 只退出登录,然后结束(用于换账号或公用电脑上清理登录态)
