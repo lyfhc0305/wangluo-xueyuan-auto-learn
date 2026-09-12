@@ -6,7 +6,7 @@
 4. 可直接运行，不必填写账号密码。如需修改设置，将 config.example.json 复制为 config.json。
 
 隐私提醒：
-发布包只含程序、空配置样例及说明。使用后生成的 .chrome-profile*、logs、state.json 和 config.json 不要随包转发。
+发布包只含程序、空配置样例及说明。使用后生成的 .chrome-profile*、logs、state*.json 和 config.json 不要随包转发。
 浏览器会在本地保存登录会话。配置中若填写密码，会以明文保存。
 日志可能包含课程记录、电脑路径或网站错误内容，分享前必须检查。
 上述内容已被 .gitignore 排除，不要强制提交。

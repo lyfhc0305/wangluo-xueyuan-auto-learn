@@ -3,6 +3,15 @@
   "version": "1.0.0",
   "private": true,
   "description": "河南干部网络学院自动学习助手",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "start": "node auto-learn.mjs",
+    "diagnose": "node auto-learn.mjs --diagnose",
+    "list": "node auto-learn.mjs --list"
+  },
   "dependencies": {
     "puppeteer-core": "^25.10.0"
   }

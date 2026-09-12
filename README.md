@@ -32,7 +32,7 @@ node auto-learn.mjs
 | `node auto-learn.mjs --profile=account2` | 使用独立的浏览器会话 |
 | `node auto-learn.mjs --no-mute` | 开启播放声音 |
 
-多个会话仍共用 `state.json`。不同账号若需要独立记录，请分别使用不同的本地文件夹。浏览器窗口应保持打开；如网站提示人工操作，请按提示处理。
+多个会话使用独立的浏览器目录和记录文件（`--profile=account2` 会生成 `.chrome-profile-account2/` 和 `state-account2.json`）。浏览器窗口应保持打开；如网站提示人工操作，请按提示处理。
 
 ## 隐私与分享
 
@@ -41,7 +41,7 @@ node auto-learn.mjs
 - `.chrome-profile*/`：浏览器 Cookie、登录态、缓存等敏感数据，不应分享。
 - `config.json`：可选配置；如果填写密码，会明文保存。建议保持账号密码为空，手动登录。
 - `logs/`：运行日志，可能含课程、学时、电脑路径和网站错误内容，分享前需检查。
-- `state.json`：本地课程处理记录，可能暴露学习情况。
+- `state.json` / `state-<profile>.json`：本地课程处理记录，可能暴露学习情况。
 
 这些文件已被 `.gitignore` 排除；不要强制加入版本控制。诊断功能只输出选定的状态字段，但一般日志仍需人工检查。程序会向目标学院网站发起正常登录及课程请求，浏览器会在本地持久保存会话，不能将其理解为“不保存任何凭据”。
 

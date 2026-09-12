@@ -3,6 +3,7 @@ config.json
 .chrome-profile*/
 logs/
 state.json
+state-*.json
 _recon/
 .env
 .env.*

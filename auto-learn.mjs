@@ -30,7 +30,6 @@ import puppeteer from 'puppeteer-core';
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const BASE = 'https://www.hngbwlxy.gov.cn/';
 const LOG_DIR = path.join(ROOT, 'logs');
-const STATE_FILE = path.join(ROOT, 'state.json');
 const CONFIG_FILE = path.join(ROOT, 'config.json');
 
 // ───────────────────────────── 参数 / 配置 ─────────────────────────────
@@ -50,6 +49,12 @@ const PROFILE_NAME = String(optVal('profile', '') || '').trim();
 const PROFILE_DIR = PROFILE_NAME
   ? path.join(ROOT, `.chrome-profile-${PROFILE_NAME.replace(/[\\/:*?"<>|]/g, '_')}`)
   : path.join(ROOT, '.chrome-profile');
+
+// 不同 --profile 共用 state.json 会串课(已选/失败记录互相污染)。
+// 默认 profile 沿用 state.json(兼容老用户)；命名 profile 用独立文件。
+const STATE_FILE = PROFILE_NAME
+  ? path.join(ROOT, `state-${PROFILE_NAME.replace(/[\\/:*?"<>|]/g, '_')}.json`)
+  : path.join(ROOT, 'state.json');
 
 const DEFAULT_CONFIG = {
   username: '',
@@ -173,7 +178,12 @@ function findBrowser() {
 function killLeftoverChrome() {
   try {
     if (process.platform === 'win32') {
-      const ps = `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -like '*${PROFILE_DIR.replace(/'/g, "''")}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
+      // -like 把 *?[] 当通配符，双引号 -Command 会展开 $，都要转义，
+      // 否则 --profile 带特殊字符时会误杀/误漏进程。
+      const esc = PROFILE_DIR.replace(/[`$"]/g, m => '`' + m)
+        .replace(/'/g, "''")
+        .replace(/([*?[\]])/g, '`$1');
+      const ps = `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -like '*${esc}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
       execSync(`powershell -NoProfile -Command "${ps}"`, { stdio: 'ignore', timeout: 30000 });
     } else {
       execSync(`pkill -f ${JSON.stringify(PROFILE_DIR)} || true`, { stdio: 'ignore', timeout: 30000, shell: '/bin/sh' });
@@ -385,21 +395,33 @@ async function fetchCourses(page, maxPages = 10) {
 }
 
 /** 我的课程与进度: id -> { browseScore, credit } */
-async function fetchMyCourses(page) {
-  const r = await api(page, 'Page/MyStudyStat', {
-    page: 1, rows: 500, sort: 'Id', order: 'desc', titleNav: '学习统计',
-  });
-  const d = (r.json && r.json.Data) || {};
+async function fetchMyCourses(page, maxPages = 20) {
   const m = new Map();
-  for (const c of d.ListData || []) {
-    m.set(c.Id, { browseScore: Number(c.BrowseScore) || 0, credit: Number(c.Credit) || 0, name: c.Name });
+  let creditSum = 0, finish, unfinish, count = 0;
+  for (let p = 1; p <= maxPages; p++) {
+    const r = await api(page, 'Page/MyStudyStat', {
+      page: p, rows: 500, sort: 'Id', order: 'desc', titleNav: '学习统计',
+    });
+    const d = (r.json && r.json.Data) || {};
+    // 第一页带汇总字段，后续页只补 ListData
+    if (p === 1) {
+      creditSum = Number(d.CreditSum) || 0;
+      finish = d.FinishCourse; unfinish = d.UnFinishCourse; count = d.Count;
+    }
+    const list = d.ListData || [];
+    if (!list.length) break;
+    for (const c of list) {
+      if (!m.has(c.Id)) m.set(c.Id, { browseScore: Number(c.BrowseScore) || 0, credit: Number(c.Credit) || 0, name: c.Name });
+    }
+    // 之前版本只取第一页(rows=500)，课多时会被截断导致误判“无课可学”
+    if (typeof count === 'number' && m.size >= count) break;
+    if (list.length < 500) break;
   }
-  return { map: m, creditSum: Number(d.CreditSum) || 0, finish: d.FinishCourse, unfinish: d.UnFinishCourse, count: d.Count };
+  return { map: m, creditSum, finish, unfinish, count };
 }
 
 const isVideo = c => c.standards.toLowerCase() === 'mp4';
 const isUnselected = c => c.learning < 0;
-const isFinished = c => c.learning >= 1;
 
 // ───────────────────────────── 选课 ─────────────────────────────
 
@@ -601,15 +623,15 @@ async function readVideoState(page) {
   });
 }
 
-async function ensurePlaying(page) {
-  return await page.evaluate(() => {
+async function ensurePlaying(page, muteAudio = true) {
+  return await page.evaluate((muteAudio) => {
     const v = document.querySelector('video');
     if (!v) return false;
-    v.muted = true;
+    if (muteAudio) v.muted = true;
     if (v.playbackRate !== 1) v.playbackRate = 1;
     if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
     return !v.paused;
-  });
+  }, muteAudio);
 }
 
 async function playCourse(browser, cfg, course, mainPage) {
@@ -622,7 +644,6 @@ async function playCourse(browser, cfg, course, mainPage) {
   // 站点限制同一账号同时只能播放一门课。上一门刚关闭时立刻打开新播放页,
   // 会弹「同时只能打开一门课程,请关闭之前页面,并于10秒后重试！」并拒绝加载。
   // 所以这里检测"页面既无视频也无滑块"的情况,等待后重试。
-  let gate = null;
   let loaded = false;
   for (let openTry = 1; openTry <= 3; openTry++) {
     try {
@@ -654,7 +675,7 @@ async function playCourse(browser, cfg, course, mainPage) {
     return { ok: false, reason: 'play-locked', retryable: true };
   }
 
-  gate = await solvePlayGate(player);
+  const gate = await solvePlayGate(player);
   if (gate === 'blocked') {
     log('  ✖ 页面不接受拖拽,判定为已限制播放');
     await player.close().catch(() => {});
@@ -678,7 +699,7 @@ async function playCourse(browser, cfg, course, mainPage) {
 
   waited = 0;
   while ((!st.duration || !isFinite(st.duration)) && waited < 60) {
-    await sleep(2000); waited += 2; await ensurePlaying(player); st = await readVideoState(player);
+    await sleep(2000); waited += 2; await ensurePlaying(player, cfg.muteAudio); st = await readVideoState(player);
   }
   if (!st.duration || !isFinite(st.duration)) {
     log('  ✖ 无法读取视频时长,跳过该课程');
@@ -722,7 +743,7 @@ async function playCourse(browser, cfg, course, mainPage) {
       if (!stalledSince) stalledSince = Date.now();
       if (Date.now() - stalledSince > 25000 && !st.quizOpen) {
         log('  ⚠ 播放停滞,尝试恢复播放…');
-        await ensurePlaying(player);
+        await ensurePlaying(player, cfg.muteAudio);
         stalledSince = Date.now();
       }
     } else { stalledSince = 0; lastPos = st.currentTime; }
@@ -807,7 +828,7 @@ async function performLogout(page) {
       : await page.target().createCDPSession();
     await client.send('Network.clearBrowserCookies');
     await client.send('Storage.clearDataForOrigin', {
-      origin: 'https://www.hngbwlxy.gov.cn',
+      origin: new URL(BASE).origin,
       storageTypes: 'all',
     });
     await client.detach().catch(() => {});
@@ -854,6 +875,7 @@ async function main() {
   log(` 目标: ${cfg.targetCredit} 学时/学分${cfg.only ? `  仅处理课程 ${cfg.only}` : ''}${cfg.maxCoursesPerRun ? `  最多 ${cfg.maxCoursesPerRun} 门` : ''}`);
   log(` 浏览器: ${chromePath}`);
   log(` 会话目录: ${path.basename(PROFILE_DIR)}${cfg.profileName ? `  (--profile=${cfg.profileName})` : ''}`);
+  log(` 记录文件: ${path.basename(STATE_FILE)}`);
   log(` 日志: ${logFile}`);
   log('══════════════════════════════════════════════════════');
 
@@ -872,7 +894,7 @@ async function main() {
     ],
   };
 
-  let browser;
+  let browser = null;
   try {
     browser = await puppeteer.launch(launchOpts);
   } catch (e) {
@@ -883,12 +905,12 @@ async function main() {
     browser = await puppeteer.launch(launchOpts);
   }
 
-  const page = (await browser.pages())[0] || await browser.newPage();
-  await preparePage(page, cfg);
   const state = loadState();
   state.courses = state.courses || {};
 
   try {
+    const page = (await browser.pages())[0] || await browser.newPage();
+    await preparePage(page, cfg);
     // --logout: 只退出登录,然后结束(用于换账号或公用电脑上清理登录态)
     if (cfg.logout) {
       await performLogout(page);
@@ -1091,7 +1113,7 @@ async function main() {
   } finally {
     if (cfg.keepOpen) {
       log('浏览器窗口保持打开(--keep-open)。按 Ctrl+C 结束进程。');
-    } else {
+    } else if (browser) {
       try { await browser.close(); log(`浏览器已关闭(登录会话保存在 ${path.basename(PROFILE_DIR)},下次无需重新登录)`); }
       catch { /* 忽略 */ }
     }

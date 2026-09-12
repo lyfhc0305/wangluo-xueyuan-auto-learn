@@ -9,16 +9,21 @@ echo "============================================"
 echo
 
 if ! command -v node >/dev/null 2>&1; then
-  echo "[错误] 未检测到 Node.js,请先安装 Node.js 后重试。"
+  echo "[错误] 未检测到 Node.js,请先安装 Node.js 22.12 或更高版本后重试。"
   echo "       macOS:  brew install node"
   echo "       Ubuntu: sudo apt install nodejs npm"
   echo "       下载:   https://nodejs.org/"
   exit 1
 fi
 
+if ! node -e "process.exit(Number(process.versions.node.split('.')[0]) >= 22 ? 0 : 1)"; then
+  echo "[错误] Node.js 版本过低($(node -v))，需要 22.12 或更高版本。"
+  exit 1
+fi
+
 if [ ! -d node_modules ]; then
   echo "首次运行,正在安装依赖,请稍候..."
-  npm install
+  npm ci || npm install
 fi
 
 echo "启动中,请不要关闭本窗口..."
