@@ -1,0 +1,17 @@
+# Local credentials and browser sessions
+config.json
+.chrome-profile*/
+logs/
+state.json
+_recon/
+.env
+.env.*
+*.pem
+*.key
+# Dependencies and generated archives
+node_modules/
+dist/
+*.zip
+*.log
+.DS_Store
+Thumbs.db

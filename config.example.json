@@ -1,0 +1,9 @@
+{
+  "username": "",
+  "password": "",
+  "targetCredit": 5,
+  "keepVisible": true,
+  "muteAudio": true,
+  "maxDurationFactor": 2.5,
+  "maxExtraMinutes": 15
+}
