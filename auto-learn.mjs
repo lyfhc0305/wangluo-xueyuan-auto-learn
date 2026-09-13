@@ -16,9 +16,14 @@
  *   node auto-learn.mjs --only=9504       只处理指定课程 ID(用于验证/补课)
  *   node auto-learn.mjs --max-courses=1   本次最多学几门
  *   node auto-learn.mjs --list            只列出「未选课」课程,不学习
- *   node auto-learn.mjs --diagnose        诊断:打印接口状态摘要
+ *   node auto-learn.mjs --plan            只计算并打印"最快攒学时"的选课顺序,不学习
+ *   node auto-learn.mjs --diagnose        诊断:打印接口状态摘要(发布版脱敏,不含用户资料)
  *   node auto-learn.mjs --reset-profile   清除登录会话
  *   node auto-learn.mjs --no-keep-visible 关闭「保持页面可见」补丁(见 README)
+ *
+ * 多账号并行(每个账号一套独立会话 + 独立 state,可同时开两个窗口一起学):
+ *   node auto-learn.mjs --profile=A --user=138xxxxxxxx --pass=xxxx --daily
+ *   node auto-learn.mjs --profile=B --user=139xxxxxxxx --pass=xxxx --daily
  */
 
 import fs from 'node:fs';
@@ -30,8 +35,9 @@ import puppeteer from 'puppeteer-core';
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const BASE = 'https://www.hngbwlxy.gov.cn/';
 const LOG_DIR = path.join(ROOT, 'logs');
-const STATE_FILE = path.join(ROOT, 'state.json');
 const CONFIG_FILE = path.join(ROOT, 'config.json');
+// 默认共用 state.json;用 --profile 时会被改成每个账号一个文件(见下方),避免多账号互相干扰
+let STATE_FILE = path.join(ROOT, 'state.json');
 
 // ───────────────────────────── 参数 / 配置 ─────────────────────────────
 
@@ -43,13 +49,28 @@ const optVal = (n, d) => {
 };
 
 /**
- * 会话目录。默认 .chrome-profile;用 --profile=张三 可以给不同账号各建一个,
- * 两个账号的登录态互不干扰(注意 state.json 是共用的,记录的是"这台机器学过哪些课")。
+ * 会话目录。默认 .chrome-profile;用 --profile=账号 可以给不同账号各建一个,
+ * 登录态与 state 文件都按账号独立,多个账号可以并行跑互不干扰。
+ *
+ * 隐私:profile 名如果本身就是手机号(直接 --profile=138xxxxxxxx 运行时很常见),
+ * 会原样出现在 state-xxx.json / logs\run-xxx.log / .chrome-profile-xxx 的文件名
+ * 和日志正文里。这里在入口统一打码成 138＊＊＊＊6693(全角星号,NTFS 文件名合法,
+ * 半角 * 是保留字符),与 并行学习.ps1 的 Get-MaskedProfile 行为一致。
  */
-const PROFILE_NAME = String(optVal('profile', '') || '').trim();
+const rawProfile = String(optVal('profile', '') || '').trim();
+const PROFILE_NAME = rawProfile.replace(/^(1[3-9]\d)\d{4}(\d{4})$/, '$1＊＊＊＊$2');
 const PROFILE_DIR = PROFILE_NAME
   ? path.join(ROOT, `.chrome-profile-${PROFILE_NAME.replace(/[\\/:*?"<>|]/g, '_')}`)
   : path.join(ROOT, '.chrome-profile');
+
+/**
+ * 多账号并行时,state 也要按账号分开。
+ * 否则 A 账号选课失败被标成 failed 的课程,B 账号会被直接跳过(见主流程里的
+ * `!(state.courses[c.id] && state.courses[c.id].failed)` 过滤)。
+ */
+if (PROFILE_NAME) {
+  STATE_FILE = path.join(ROOT, `state-${PROFILE_NAME.replace(/[\\/:*?"<>|]/g, '_')}.json`);
+}
 
 const DEFAULT_CONFIG = {
   username: '',
@@ -73,10 +94,17 @@ function loadConfig() {
   if (!isFinite(cfg.targetCredit)) cfg.targetCredit = 5;
   cfg.only = optVal('only', null);
   if (cfg.only) cfg.only = String(cfg.only);
+  // 多账号并行:账号密码可以直接从命令行给(--user=xxx --pass=yyy),
+  // 这样就不必把明文写进 config.json,也不会被记进日志。
+  const cliUser = optVal('user', '');
+  const cliPass = optVal('pass', '');
+  if (cliUser) cfg.username = String(cliUser);
+  if (cliPass) cfg.password = String(cliPass);
   cfg.maxCoursesPerRun = Number(optVal('max-courses', cfg.maxCoursesPerRun)) || 0;
   if (hasFlag('no-keep-visible')) cfg.keepVisible = false;
   if (hasFlag('no-mute')) cfg.muteAudio = false;
   cfg.listOnly = hasFlag('list');
+  cfg.plan = hasFlag('plan');
   cfg.diagnose = hasFlag('diagnose');
   cfg.keepOpen = hasFlag('keep-open');
   cfg.logout = hasFlag('logout');
@@ -365,7 +393,7 @@ const mapCourse = c => ({
  * 首页用的 Page/CourseListSy 是公开列表,其 Learning 恒为 -1,不能判断选课状态。
  * 这里返回的 Learning 就是本人学习进度:-1 未选课,0~1 在学(=浏览百分比)。
  */
-async function fetchCourses(page, maxPages = 10) {
+async function fetchCourses(page, maxPages = 30) {
   const seen = new Map();
   let total = 0;
   for (let p = 1; p <= maxPages; p++) {
@@ -379,7 +407,9 @@ async function fetchCourses(page, maxPages = 10) {
     const list = d.ListData || [];
     if (!list.length) break;
     for (const c of list) if (!seen.has(c.Id)) seen.set(c.Id, mapCourse(c));
-    if (seen.size >= total) break;
+    // 拿齐即停。maxPages 只是保险丝:按 200 条/页,30 页 = 6000 门,
+    // 足够覆盖全站课程总量(此前上限 10 页会截掉约 119 门)。
+    if (total && seen.size >= total) break;
   }
   return [...seen.values()];
 }
@@ -400,6 +430,52 @@ async function fetchMyCourses(page) {
 const isVideo = c => c.standards.toLowerCase() === 'mp4';
 const isUnselected = c => c.learning < 0;
 const isFinished = c => c.learning >= 1;
+
+// ─────────────────── 选课策略:按「学分 ÷ 还需播放时长」取最快的 ───────────────────
+
+/**
+ * 站点给的「学时」是课程的标称学分(Credit),**不是**按真实播放时长折算的:
+ * 一门 2 分钟的微课给 0.25 学时,一门 37 分钟的单视频课给 1 学时。
+ * 所以真实效率 = Credit ÷ 真实视频秒数,两类课能差 3~5 倍(实测见 README)。
+ *
+ * 于是最优策略不是"默认按最短时长选",而是把候选课按
+ *      学分 ÷ 还需播放的秒数
+ * 从大到小排,每轮都取最高的那门。已选未看完的课按剩余比例折算,
+ * 于是"看了 90% 的微课"会排到最前面,而"只看了 5% 的 37 分钟长课"会被排到最后。
+ *
+ * 时长来源:优先用 state.json 里这门课实测过的 duration(最准),
+ * 否则用课程 Time 字段(单位小时)换算 —— 实测 Time 偏短,真实时长约为它的 1.38 倍。
+ */
+const TIME_FIELD_FACTOR = 1.38;   // Time 字段 → 真实时长 的经验倍数
+const MIN_DURATION = 60;          // 兜底下限,避免 Time 四舍五入成 0
+
+function estimateDuration(course, state) {
+  const rec = state.courses && state.courses[course.id];
+  if (rec && rec.duration > 0) return rec.duration;
+  return Math.max((course.time || 0) * 3600 * TIME_FIELD_FACTOR, MIN_DURATION);
+}
+
+/** 给候选课打分:rate = 学分/小时,以及"这门课现在学还能拿多少学分" */
+function rankCourse(course, mineRec, state) {
+  const total = estimateDuration(course, state);
+  const enrolled = !isUnselected(course);
+  const donePct = enrolled && mineRec ? Math.min(100, Math.max(0, mineRec.browseScore)) : 0;
+  const remainFrac = 1 - donePct / 100;
+  const remain = Math.max(total * remainFrac, 5);
+  // ⚠ 实测(2026-09-13):学完一门课实际到账的学时 = 课程学分 × **这次新看完的比例**。
+  //   一门 0.25 学分、已看 55% 的微课,看完只加 0.11(=0.25×45%),不是 0.25;
+  //   一门 1 学分、已看 5.16% 的单视频课,看完只加 0.95(=1×94.84%)。
+  //   既然"还能拿的学分"和"还需播的时长"同比例缩小,效率就恒等于:
+  //        学分 ÷ 全片时长
+  //   与已看进度无关 —— 所以排序只看这个比值,已看进度只用来算"现在学能拿多少"。
+  const gain = course.credit * remainFrac;
+  return {
+    course, total, remain, gain,
+    coming: enrolled && donePct > 0,
+    donePct,
+    rate: course.credit / total * 3600,
+  };
+}
 
 // ───────────────────────────── 选课 ─────────────────────────────
 
@@ -601,15 +677,15 @@ async function readVideoState(page) {
   });
 }
 
-async function ensurePlaying(page) {
-  return await page.evaluate(() => {
+async function ensurePlaying(page, mute = true) {
+  return await page.evaluate(m => {
     const v = document.querySelector('video');
     if (!v) return false;
-    v.muted = true;
+    if (m) v.muted = true;          // 只有默认静音模式才动 muted;--no-mute 时保留用户的声音
     if (v.playbackRate !== 1) v.playbackRate = 1;
     if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
     return !v.paused;
-  });
+  }, mute);
 }
 
 async function playCourse(browser, cfg, course, mainPage) {
@@ -678,7 +754,7 @@ async function playCourse(browser, cfg, course, mainPage) {
 
   waited = 0;
   while ((!st.duration || !isFinite(st.duration)) && waited < 60) {
-    await sleep(2000); waited += 2; await ensurePlaying(player); st = await readVideoState(player);
+    await sleep(2000); waited += 2; await ensurePlaying(player, cfg.muteAudio); st = await readVideoState(player);
   }
   if (!st.duration || !isFinite(st.duration)) {
     log('  ✖ 无法读取视频时长,跳过该课程');
@@ -722,7 +798,7 @@ async function playCourse(browser, cfg, course, mainPage) {
       if (!stalledSince) stalledSince = Date.now();
       if (Date.now() - stalledSince > 25000 && !st.quizOpen) {
         log('  ⚠ 播放停滞,尝试恢复播放…');
-        await ensurePlaying(player);
+        await ensurePlaying(player, cfg.muteAudio);
         stalledSince = Date.now();
       }
     } else { stalledSince = 0; lastPos = st.currentTime; }
@@ -840,7 +916,7 @@ async function performLogout(page) {
 async function main() {
   const cfg = loadConfig();
   if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
-  const logFile = path.join(LOG_DIR, `run-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.log`);
+  const logFile = path.join(LOG_DIR, `run-${PROFILE_NAME ? PROFILE_NAME.replace(/[\\/:*?"<>|]/g, '_') + '-' : ''}${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.log`);
 
   if (hasFlag('reset-profile') && fs.existsSync(PROFILE_DIR)) {
     fs.rmSync(PROFILE_DIR, { recursive: true, force: true });
@@ -854,7 +930,9 @@ async function main() {
   log(` 目标: ${cfg.targetCredit} 学时/学分${cfg.only ? `  仅处理课程 ${cfg.only}` : ''}${cfg.maxCoursesPerRun ? `  最多 ${cfg.maxCoursesPerRun} 门` : ''}`);
   log(` 浏览器: ${chromePath}`);
   log(` 会话目录: ${path.basename(PROFILE_DIR)}${cfg.profileName ? `  (--profile=${cfg.profileName})` : ''}`);
-  log(` 日志: ${logFile}`);
+  log(` 状态文件: ${path.basename(STATE_FILE)}`);
+  log(` 账号: ${cfg.username ? cfg.username.replace(/^(\d{3})\d{4}(\d{4})$/, '$1****$2') : '(未提供,将等待手动登录)'}`);
+  log(` 日志: logs${path.sep}${path.basename(logFile)}`);   // 相对路径,不把含本机用户名的绝对路径写进日志
   log('══════════════════════════════════════════════════════');
 
   const launchOpts = {
@@ -867,6 +945,11 @@ async function main() {
       '--start-maximized',
       '--autoplay-policy=no-user-gesture-required',
       '--disable-blink-features=AutomationControlled',
+      // 多个账号同时跑时,窗口必然互相遮挡 / 有页面在后台。
+      // 这三个开关避免 Chrome 对后台窗口节流,让视频与页面上报保持正常节奏。
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
       '--disable-features=Translate,OptimizationHints',
       ...(cfg.muteAudio ? ['--mute-audio'] : []),
     ],
@@ -902,6 +985,7 @@ async function main() {
     log(`当前进度: 学时/学分 ${credit.value} (来源 ${credit.source}) | 已完成 ${mine.finish} 门,未完成 ${mine.unfinish} 门,累计 ${mine.count} 门`);
 
     if (cfg.diagnose) {
+      // 发布版隐私脱敏:只输出状态摘要,不输出完整用户资料(姓名/手机号等)
       log('\n──── 诊断 ────');
       const ui = await api(page, 'Info/GetUserInfo', {});
       log('GetUserInfo: ' + JSON.stringify({ status: ui.status, online: ui.json?.Data?.IsOnline === true }));
@@ -925,6 +1009,37 @@ async function main() {
       return;
     }
 
+    if (cfg.plan) {
+      const mineNow = (await fetchMyCourses(page)).map;
+      const ranked = courses
+        .filter(isVideo)
+        .filter(c => c.credit > 0)
+        .filter(c => isUnselected(c) || (mineNow.get(c.id) && mineNow.get(c.id).browseScore < 100))
+        .filter(c => !(state.courses[c.id] && state.courses[c.id].failed))
+        .map(c => rankCourse(c, mineNow.get(c.id), state))
+        .sort((a, b) => b.rate - a.rate);
+
+      log('\n──── 最快攒学时选课计划(按「学分 ÷ 全片时长」排序)────');
+      log(`候选 ${ranked.length} 门(可播放的没学满的 Mp4 课)`);
+      let credit2 = 0, sec = 0, n = 0;
+      const target = Math.min(isFinite(cfg.targetCredit) ? cfg.targetCredit : 5, 5);
+      for (const p of ranked) {
+        if (credit2 >= target - 1e-9) break;
+        credit2 += p.gain; sec += p.remain; n++;
+      }
+      ranked.slice(0, 20).forEach((p, i) => {
+        log(`  ${String(i + 1).padStart(3)}. ${p.rate.toFixed(2).padStart(6)} 学时/小时  ${p.course.credit} 学分 / 全片 ${(p.total / 60).toFixed(1)} 分钟` +
+          `${p.coming ? ` (已看 ${p.donePct.toFixed(0)}%,需播 ${(p.remain / 60).toFixed(1)} 分)` : ''}  ${p.course.type}/${p.course.standards}  《${p.course.name.slice(0, 30)}》`);
+      });
+      if (ranked.length > 20) log(`  … 以及另外 ${ranked.length - 20} 门`);
+      const overhead = n * 30 / 60;   // 实测每门换课开销约 30 秒(关播放窗后等"单课程锁"释放)
+      log('');
+      log(`按此顺序取前 ${n} 门 = ${credit2.toFixed(2)} 学时:`);
+      log(`  纯播放 ${(sec / 60).toFixed(0)} 分钟 + 换课开销 ${overhead.toFixed(0)} 分钟 ≈ ${(sec / 60 + overhead).toFixed(0)} 分钟`);
+      log(`  (站点每天上限 5 学时,所以一天就是这个量;视频必须 1 倍速真实播放,无法压缩)`);
+      return;
+    }
+
     let round = 0;
     let dailyLimitHit = false;
     let noGainStreak = 0;            // 连续几门课没拿到学时(兜底:防每日上限空转)
@@ -940,6 +1055,7 @@ async function main() {
       }
 
       let course;
+      let picked = null;
       if (cfg.only) {
         courses = await fetchCourses(page);
         course = courses.find(c => String(c.id) === cfg.only);
@@ -952,6 +1068,7 @@ async function main() {
         const mineNow = (await fetchMyCourses(page)).map;
         const needsWork = c => {
           if (!isVideo(c)) return false;
+          if (!(c.credit > 0)) return false;   // 不给学分的课不值得花时间
           if (isUnselected(c)) return true;
           const rec = mineNow.get(c.id);
           return !!rec && rec.browseScore < 100;
@@ -960,22 +1077,32 @@ async function main() {
           .filter(needsWork)
           .filter(c => !skipThisRun.has(c.id))
           .filter(c => !(state.courses[c.id] && state.courses[c.id].failed))
-          .sort((a, b) => {
-            const ai = isUnselected(a) ? 1 : 0;   // 先把已选的半截课补完
-            const bi = isUnselected(b) ? 1 : 0;
-            return (ai - bi) || (b.required - a.required) || (a.time - b.time);
-          });
+          .map(c => rankCourse(c, mineNow.get(c.id), state))
+          .sort((a, b) => (b.rate - a.rate) || (b.course.required - a.course.required) || (a.remain - b.remain));
         if (!pending.length) {
           log('\n没有需要继续学习的视频课程了。');
           break;
         }
-        course = pending[0];
+        course = pending[0].course;
+        picked = pending[0];
+        if (pending.length > 1) {
+          log(`  选课策略: 按「学分 ÷ 全片时长」排序,当前最优候选:`);
+          for (const p of pending.slice(0, 3)) {
+            log(`    · ${p.rate.toFixed(2).padStart(6)} 学时/小时  《${p.course.name.slice(0, 22)}》` +
+              ` 学分${p.course.credit} 全片${(p.total / 60).toFixed(1)}分 需播${(p.remain / 60).toFixed(1)}分可拿${p.gain.toFixed(2)}${p.coming ? ` (已看${p.donePct.toFixed(0)}%)` : ''}`);
+          }
+        }
       }
 
       round++;
       log('');
       log(`──────── 第 ${round} 门 ────────`);
       log(`《${course.name}》 id=${course.id} 学分=${course.credit} 进度=${course.learning} 类型=${course.type}/${course.standards}`);
+      if (picked) {
+        log(`  预计: 需播 ${(picked.remain / 60).toFixed(1)} 分钟,可拿 ${picked.gain.toFixed(2)} 学时` +
+          ` → ${picked.rate.toFixed(2)} 学时/小时(全片 ${(picked.total / 60).toFixed(1)} 分钟 / ${picked.course.credit} 学分` +
+          `${picked.coming ? `,已看 ${picked.donePct.toFixed(0)}%` : ',未选课'})`);
+      }
 
       // 1) 选课(已在学则跳过)
       if (isUnselected(course)) {
