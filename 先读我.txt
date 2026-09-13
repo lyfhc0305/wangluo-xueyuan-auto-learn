@@ -12,5 +12,8 @@
 上述内容已被 .gitignore 排除，不要强制提交。
 
 换账号：node auto-learn.mjs --logout
+多账号并行：.\并行学习.ps1（账号存 accounts.local.json，明文密码勿外传）
+选课预览：node auto-learn.mjs --plan
 诊断：node auto-learn.mjs --diagnose（仅输出接口状态摘要）
+分享前自查：node privacy-check.mjs
 详细命令和注意事项见 README.md。
