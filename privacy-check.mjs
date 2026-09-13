@@ -59,7 +59,10 @@ console.log(' 隐私自查:', abs);
 console.log('════════════════════════════════════════════\n');
 
 // ── zip 或目录 ──
-if (abs.toLowerCase().endsWith('.zip')) {
+if (!fs.existsSync(abs)) {
+  console.log('✘ 路径不存在:' + abs);
+  process.exitCode = 2;
+} else if (abs.toLowerCase().endsWith('.zip')) {
   const zs = fs.readFileSync(abs).toString('latin1');
   for (const p of ['Users', 'Desktop', 'AppData']) {
     if (zs.includes(p)) HIGH.push([path.basename(abs), `压缩包头含 "${p}"`]);
@@ -69,6 +72,10 @@ if (abs.toLowerCase().endsWith('.zip')) {
   console.log(`检查压缩包: ${(fs.statSync(abs).size / 1024).toFixed(1)} KB`);
   console.log('  包头路径痕迹: ' + (HIGH.length || absEntries.length ? '有(见下方)' : '无'));
   console.log('  ※ 内容需解压后再查,建议直接对解压后的文件夹运行本工具\n');
+} else if (!fs.statSync(abs).isDirectory()) {
+  console.log('✘ 目标既不是目录也不是 .zip:' + abs);
+  console.log('  用法:node privacy-check.mjs [文件夹|xxx.zip]');
+  process.exitCode = 2;
 } else {
   const { files, dirs } = walk(abs);
   console.log(`扫描 ${files.length} 个文本文件…\n`);
@@ -120,23 +127,27 @@ if (abs.toLowerCase().endsWith('.zip')) {
   }
 }
 
-// ── 汇总 ──
-const show = (title, list, icon) => {
-  console.log(`${icon} ${title}: ${list.length}`);
-  list.forEach(([where, what]) => console.log(`    · ${where}\n      ${what.slice(0, 150)}`));
-};
-show('高危(务必处理)', HIGH, HIGH.length ? '⚠' : '✔');
-show('中危(建议确认)', MED, MED.length ? '⚠' : '✔');
-show('提醒(运行时生成物)', INFO, INFO.length ? 'ℹ' : '✔');
-
-console.log('\n────────────────────────────────────────────');
-if (HIGH.length) {
-  console.log(' 结论:发现高危内容,请处理后再分享。');
-  process.exitCode = 1;
-} else if (MED.length) {
-  console.log(' 结论:无高危内容;中危项请自行确认是否可接受。');
+// ── 汇总(目标无效时已经置 exitCode=2,不再输出"可以放心分享"之类的结论) ──
+if (process.exitCode === 2) {
+  // 用法错误,只保留上面的错误提示
 } else {
-  console.log(' 结论:✔ 未发现个人数据,可以放心分享。');
+  const show = (title, list, icon) => {
+    console.log(`${icon} ${title}: ${list.length}`);
+    list.forEach(([where, what]) => console.log(`    · ${where}\n      ${what.slice(0, 150)}`));
+  };
+  show('高危(务必处理)', HIGH, HIGH.length ? '⚠' : '✔');
+  show('中危(建议确认)', MED, MED.length ? '⚠' : '✔');
+  show('提醒(运行时生成物)', INFO, INFO.length ? 'ℹ' : '✔');
+
+  console.log('\n────────────────────────────────────────────');
+  if (HIGH.length) {
+    console.log(' 结论:发现高危内容,请处理后再分享。');
+    process.exitCode = 1;
+  } else if (MED.length) {
+    console.log(' 结论:无高危内容;中危项请自行确认是否可接受。');
+  } else {
+    console.log(' 结论:✔ 未发现个人数据,可以放心分享。');
+  }
+  console.log(' 注意:Cookie、令牌一般存在二进制文件里,本工具查不到明文,');
+  console.log('       所以请务必确认没有把 .chrome-profile 一起发出去。');
 }
-console.log(' 注意:Cookie、令牌一般存在二进制文件里,本工具查不到明文,');
-console.log('       所以请务必确认没有把 .chrome-profile 一起发出去。');
