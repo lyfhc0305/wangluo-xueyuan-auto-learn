@@ -32,6 +32,7 @@ import path from 'node:path';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer-core';
+import { resolveProfilePaths, isPermanentFailure, nextNoGainStreak, launchProfileBrowser } from './runtime-utils.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const BASE = 'https://www.hngbwlxy.gov.cn/';
@@ -519,15 +520,53 @@ async function fetchCourses(page, maxPages = 30) {
 
 /** 我的课程与进度: id -> { browseScore, credit } */
 async function fetchMyCourses(page) {
-  const r = await api(page, 'Page/MyStudyStat', {
-    page: 1, rows: 500, sort: 'Id', order: 'desc', titleNav: '学习统计',
-  });
-  const d = (r.json && r.json.Data) || {};
   const m = new Map();
-  for (const c of d.ListData || []) {
-    m.set(c.Id, { browseScore: Number(c.BrowseScore) || 0, credit: Number(c.Credit) || 0, name: c.Name });
+  let firstData = null;
+  let expectedTotal = null;
+  let p = 1;
+
+  while (true) {
+    const r = await api(page, 'Page/MyStudyStat', {
+      page: p, rows: 500, sort: 'Id', order: 'desc', titleNav: '学习统计',
+    });
+    if (!r.ok || r.status !== 200) {
+      throw new Error(`获取学习统计第 ${p} 页失败(HTTP ${r.status})`);
+    }
+    const d = (r.json && r.json.Data) || {};
+    if (!firstData) {
+      firstData = d;
+      expectedTotal = d.Count !== undefined && d.Count !== null && d.Count !== '' ? Number(d.Count) : null;
+    }
+    const list = d.ListData || [];
+    if (list.length === 0) {
+      if (expectedTotal !== null && m.size < expectedTotal) {
+        throw new Error(`获取学习统计分页结果不完整: 预期 ${expectedTotal} 条, 实际仅获取 ${m.size} 条`);
+      }
+      break;
+    }
+
+    const prevSize = m.size;
+    for (const c of list) {
+      m.set(c.Id, { browseScore: Number(c.BrowseScore) || 0, credit: Number(c.Credit) || 0, name: c.Name });
+    }
+
+    if (expectedTotal !== null) {
+      if (m.size >= expectedTotal) break;
+      if (m.size === prevSize) {
+        throw new Error(`获取学习统计分页结果不完整或重复(当前 ${m.size} 条, 预期 ${expectedTotal} 条)`);
+      }
+    }
+    p++;
   }
-  return { map: m, creditSum: Number(d.CreditSum) || 0, finish: d.FinishCourse, unfinish: d.UnFinishCourse, count: d.Count };
+
+  const d = firstData || {};
+  return {
+    map: m,
+    creditSum: Number(d.CreditSum) || 0,
+    finish: d.FinishCourse !== undefined ? Number(d.FinishCourse) : undefined,
+    unfinish: d.UnFinishCourse !== undefined ? Number(d.UnFinishCourse) : undefined,
+    count: expectedTotal !== null ? expectedTotal : m.size,
+  };
 }
 
 const isVideo = c => c.standards.toLowerCase() === 'mp4';
@@ -812,7 +851,7 @@ async function playCourse(browser, cfg, course, mainPage) {
     } catch (e) {
       log(`  ✖ 打开播放页失败: ${e.message}`);
       await player.close().catch(() => {});
-      return { ok: false, reason: 'open-failed' };
+      return { ok: false, reason: 'open-failed', retryable: true };
     }
 
     await sleep(4000);
@@ -876,6 +915,7 @@ async function playCourse(browser, cfg, course, mainPage) {
 
   const hardDeadline = Date.now() + remain * 1000 * cfg.maxDurationFactor + cfg.maxExtraMinutes * 60 * 1000;
   let lastLog = 0, lastPos = startAt, stalledSince = 0, quizNotified = false;
+  let stalledStage25 = false, stalledStage50 = false, stalledStage80 = false;
 
   while (true) {
     await sleep(2000);
@@ -902,12 +942,53 @@ async function playCourse(browser, cfg, course, mainPage) {
 
     if (Math.abs(st.currentTime - lastPos) < 0.4) {
       if (!stalledSince) stalledSince = Date.now();
-      if (Date.now() - stalledSince > 25000 && !st.quizOpen) {
-        log('  ⚠ 播放停滞,尝试恢复播放…');
-        await ensurePlaying(player, cfg.muteAudio);
-        stalledSince = Date.now();
+      const stallDuration = Date.now() - stalledSince;
+      if (!st.quizOpen) {
+        if (stallDuration > 120000) {
+          log('  ✖ 播放停滞超过 120 秒且尝试恢复无效,看门狗介入: 关闭本门课程稍后重试');
+          await player.close().catch(() => {});
+          return { ok: false, reason: 'stalled-watchdog', retryable: true, duration };
+        } else if (stallDuration > 80000 && !stalledStage80) {
+          stalledStage80 = true;
+          log('  ⚠ 播放持续停滞(80s),重载视频媒体流…');
+          await player.evaluate(m => {
+            const v = document.querySelector('video');
+            if (!v) return;
+            try {
+              if (m) v.muted = true;
+              const cur = v.currentTime;
+              v.load();
+              v.currentTime = cur;
+              const p = v.play();
+              if (p && p.catch) p.catch(() => {});
+            } catch {}
+          }, cfg.muteAudio).catch(() => {});
+        } else if (stallDuration > 50000 && !stalledStage50) {
+          stalledStage50 = true;
+          log('  ⚠ 播放持续停滞(50s),微调播放进度触发解码与缓冲重试…');
+          await player.evaluate(m => {
+            const v = document.querySelector('video');
+            if (!v) return;
+            try {
+              if (m) v.muted = true;
+              v.currentTime = v.currentTime > 1 ? v.currentTime - 0.5 : v.currentTime + 0.5;
+              const p = v.play();
+              if (p && p.catch) p.catch(() => {});
+            } catch {}
+          }, cfg.muteAudio).catch(() => {});
+        } else if (stallDuration > 25000 && !stalledStage25) {
+          stalledStage25 = true;
+          log('  ⚠ 播放停滞(25s),尝试恢复播放…');
+          await ensurePlaying(player, cfg.muteAudio);
+        }
       }
-    } else { stalledSince = 0; lastPos = st.currentTime; }
+    } else {
+      stalledSince = 0;
+      stalledStage25 = false;
+      stalledStage50 = false;
+      stalledStage80 = false;
+      lastPos = st.currentTime;
+    }
 
     if (Date.now() - lastLog > 60000) {
       lastLog = Date.now();
@@ -918,7 +999,7 @@ async function playCourse(browser, cfg, course, mainPage) {
     if (Date.now() > hardDeadline) {
       log('  ⚠ 超过预设最长等待时间,放弃该课程');
       await player.close().catch(() => {});
-      return { ok: false, reason: 'timeout' };
+      return { ok: false, reason: 'timeout', retryable: true, duration };
     }
   }
 
@@ -1130,7 +1211,7 @@ async function main() {
         .filter(c => c.credit > 0)
         .filter(c => !cfg.newestSingle || isSingleVideo(c))
         .filter(c => isUnselected(c) || (mineNow.get(c.id) && mineNow.get(c.id).browseScore < 100))
-        .filter(c => !(state.courses[c.id] && state.courses[c.id].failed))
+        .filter(c => !isPermanentFailure(state.courses[c.id]))
         .map(c => rankCourse(c, mineNow.get(c.id), state))
         .sort(cfg.newestSingle
           ? ((a, b) => (b.course.created - a.course.created) || (Number(b.course.id) - Number(a.course.id)))
@@ -1180,6 +1261,10 @@ async function main() {
         courses = await fetchCourses(page);
         course = courses.find(c => String(c.id) === cfg.only);
         if (!course) { log(`✖ 未找到课程 ID ${cfg.only}`); break; }
+        if (skipThisRun.has(course.id)) {
+          log(`  --only 课程 ${cfg.only} 本次尝试未成功,不再重复尝试`);
+          break;
+        }
       } else {
         courses = await fetchCourses(page);
         // 用个人学习统计里的 BrowseScore(0~100)判断"还没学满",这个口径
@@ -1197,7 +1282,7 @@ async function main() {
         const pending = courses
           .filter(needsWork)
           .filter(c => !skipThisRun.has(c.id))
-          .filter(c => !(state.courses[c.id] && state.courses[c.id].failed))
+          .filter(c => !isPermanentFailure(state.courses[c.id]))
           .map(c => rankCourse(c, mineNow.get(c.id), state))
           .sort(cfg.newestSingle
             // --newest-single:发布时间从新到旧;同一天的按课程 Id 从大到小(站点按发布顺序递增)
@@ -1255,7 +1340,8 @@ async function main() {
           }
           if (!(enr.Type > 0)) {
             log('    ⚠ 选课未成功,跳过');
-            state.courses[course.id] = { name: course.name, failed: true, reason: 'enroll: ' + msg };
+            skipThisRun.add(course.id);
+            state.courses[course.id] = { name: course.name, failed: true, retryable: true, reason: 'enroll: ' + msg };
             saveState(state);
             continue;
           }
@@ -1322,8 +1408,7 @@ async function main() {
 
       // 兜底:连续 2 门课学时都没涨,多半是撞上每日上限(已选课不会返回那条提示,
       // 只能靠这个判断),继续跑只会空转。
-      const gained = (credit.value !== null && creditBefore !== null) ? credit.value - creditBefore : 0;
-      noGainStreak = gained > 0.001 ? 0 : noGainStreak + 1;
+      noGainStreak = nextNoGainStreak(noGainStreak, res, creditBefore, credit.value);
       if (dailyLimitHit || noGainStreak >= 2) {
         if (!dailyLimitHit) {
           log('');
@@ -1355,4 +1440,13 @@ async function main() {
   }
 }
 
-main();
+const isDirectRun = process.argv[1] && (
+  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url)) ||
+  process.argv[1].endsWith('auto-learn.mjs')
+);
+
+if (isDirectRun) {
+  main();
+}
+
+export { fetchMyCourses, playCourse, main };

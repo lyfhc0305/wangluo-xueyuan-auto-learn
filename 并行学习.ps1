@@ -19,11 +19,23 @@
 param(
   [switch]$Daily = $true,
   [string[]]$Accounts,
-  [int]$MaxAccounts = 3
+  [int]$MaxAccounts = 3,
+  [switch]$Status = $false,
+  [switch]$Monitor = $false
 )
 
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
+
+if ($Status) {
+  & node batch-learn.mjs --status
+  exit 0
+}
+
+if ($Monitor) {
+  & node batch-learn.mjs
+  exit 0
+}
 . (Join-Path $PSScriptRoot 'native-args.ps1')
 
 $credFile = Join-Path $PSScriptRoot 'accounts.local.json'
@@ -84,7 +96,7 @@ foreach ($a in $list) { Write-Host "  · $(Get-MaskedProfile $a.user)" }
 $started = @()
 foreach ($a in $list) {
   $profileName = if ($a.profile) { [string]$a.profile } else { [string]$a.user }
-  $argList = @('auto-learn.mjs', "--profile=$profileName", "--user=$($a.user)", "--pass=$($a.pass)")
+  $argList = @('auto-learn.mjs', "--profile=$profileName", "--user=$($a.user)", "--pass=$($a.pass)", '--newest-single')
   if ($Daily) { $argList += '--daily' }
   $argLine = ($argList | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' '
   $p = Start-Process -FilePath 'node' -ArgumentList $argLine -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru
