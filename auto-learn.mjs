@@ -16,7 +16,8 @@
  *   node auto-learn.mjs --only=9504       只处理指定课程 ID(用于验证/补课)
  *   node auto-learn.mjs --max-courses=1   本次最多学几门
  *   node auto-learn.mjs --list            只列出「未选课」课程,不学习
- *   node auto-learn.mjs --plan            只计算并打印"最快攒学时"的选课顺序,不学习
+ *   node auto-learn.mjs --newest-single   换策略:只学单视频课,按发布时间从新到旧
+ *   node auto-learn.mjs --plan            只计算并打印选课顺序,不学习
  *   node auto-learn.mjs --diagnose        诊断:打印接口状态摘要(发布版脱敏,不含用户资料)
  *   node auto-learn.mjs --reset-profile   清除登录会话
  *   node auto-learn.mjs --no-keep-visible 关闭「保持页面可见」补丁(见 README)
@@ -105,6 +106,10 @@ function loadConfig() {
   if (hasFlag('no-mute')) cfg.muteAudio = false;
   cfg.listOnly = hasFlag('list');
   cfg.plan = hasFlag('plan');
+  // --newest-single(别名 --newest):换一种选课策略 —— 只学「单视频课」,
+  // 且按发布时间从新到旧取,不再按「学分 ÷ 全片时长」挑最快的。
+  cfg.newestSingle = hasFlag('newest-single') || hasFlag('newest')
+    || String(optVal('strategy', '')).toLowerCase() === 'newest-single';
   cfg.diagnose = hasFlag('diagnose');
   cfg.keepOpen = hasFlag('keep-open');
   cfg.logout = hasFlag('logout');
@@ -130,6 +135,12 @@ function log(...parts) {
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const fmtTime = s => `${pad(Math.floor(s / 60))}:${pad(Math.floor(s % 60))}`;
+/** 发布时间(毫秒) → 2026-08-29;拿不到时返回「未知」 */
+const fmtDate = ms => {
+  if (!ms) return '未知';
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
 
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; }
@@ -377,6 +388,12 @@ async function ensureLoggedIn(page, cfg) {
 
 // ───────────────────────────── 课程列表 ─────────────────────────────
 
+/** 课程发布时间。站点给的是 ASP.NET 的 /Date(毫秒+0800)/ 格式。 */
+const parseCreateDate = s => {
+  const m = /\/Date\((\d+)/.exec(String(s || ''));
+  return m ? Number(m[1]) : 0;
+};
+
 const mapCourse = c => ({
   id: c.Id,
   name: c.Name,
@@ -386,6 +403,8 @@ const mapCourse = c => ({
   type: String(c.Type || ''),
   time: Number(c.Time) || 0,
   required: !!c.RequiredFlag,
+  created: parseCreateDate(c.CreateDate),   // 发布时间(毫秒),0 表示接口没给
+  code: String(c.Code || ''),               // 形如 20260829026,前 8 位是发布日
 });
 
 /**
@@ -430,6 +449,9 @@ async function fetchMyCourses(page) {
 const isVideo = c => c.standards.toLowerCase() === 'mp4';
 const isUnselected = c => c.learning < 0;
 const isFinished = c => c.learning >= 1;
+/** 「单视频课」:站点 Type 字段为 SingleCourse(整门课只有一个视频,学分通常 0.5~1)。
+ *  与之相对的是 MicroCourse(微课,几分钟一节,学分 0.25)。 */
+const isSingleVideo = c => c.type.toLowerCase() === 'singlecourse';
 
 // ─────────────────── 选课策略:按「学分 ÷ 还需播放时长」取最快的 ───────────────────
 
@@ -928,6 +950,7 @@ async function main() {
   log('══════════════════════════════════════════════════════');
   log(' 河南干部网络学院 · 自动学习助手');
   log(` 目标: ${cfg.targetCredit} 学时/学分${cfg.only ? `  仅处理课程 ${cfg.only}` : ''}${cfg.maxCoursesPerRun ? `  最多 ${cfg.maxCoursesPerRun} 门` : ''}`);
+  log(` 选课策略: ${cfg.newestSingle ? '最新单视频课(发布时间从新到旧)' : '最快攒学时(学分÷全片时长)'}`);
   log(` 浏览器: ${chromePath}`);
   log(` 会话目录: ${path.basename(PROFILE_DIR)}${cfg.profileName ? `  (--profile=${cfg.profileName})` : ''}`);
   log(` 状态文件: ${path.basename(STATE_FILE)}`);
@@ -1000,11 +1023,18 @@ async function main() {
     log(`课程中心: 共 ${courses.length} 门(已抓取),未选课 ${courses.filter(isUnselected).length} 门,已选/在学 ${courses.filter(c => !isUnselected(c)).length} 门`);
 
     if (cfg.listOnly) {
-      const pending = courses.filter(c => isUnselected(c) && isVideo(c));
-      log(`\n未选课的可播放视频课程 (${pending.length} 门,按学时升序):`);
-      pending.sort((a, b) => a.time - b.time)
+      let pending = courses.filter(c => isUnselected(c) && isVideo(c));
+      if (cfg.newestSingle) pending = pending.filter(isSingleVideo);
+      log(cfg.newestSingle
+        ? `\n未选课的单视频课 (${pending.length} 门,按发布时间从新到旧):`
+        : `\n未选课的可播放视频课程 (${pending.length} 门,按学时升序):`);
+      pending
+        .sort(cfg.newestSingle
+          ? ((a, b) => (b.created - a.created) || (Number(b.id) - Number(a.id)))
+          : ((a, b) => a.time - b.time))
         .slice(0, 60)
-        .forEach((c, i) => log(`  ${String(i + 1).padStart(3)}. [${c.id}] ${c.name}  学分 ${c.credit}  时长参考 ${c.time}`));
+        .forEach((c, i) => log(`  ${String(i + 1).padStart(3)}. [${c.id}] ${c.name}  学分 ${c.credit}  时长参考 ${c.time}` +
+          `${cfg.newestSingle ? `  发布 ${fmtDate(c.created)}` : ''}`));
       if (pending.length > 60) log(`  … 以及另外 ${pending.length - 60} 门`);
       return;
     }
@@ -1014,13 +1044,18 @@ async function main() {
       const ranked = courses
         .filter(isVideo)
         .filter(c => c.credit > 0)
+        .filter(c => !cfg.newestSingle || isSingleVideo(c))
         .filter(c => isUnselected(c) || (mineNow.get(c.id) && mineNow.get(c.id).browseScore < 100))
         .filter(c => !(state.courses[c.id] && state.courses[c.id].failed))
         .map(c => rankCourse(c, mineNow.get(c.id), state))
-        .sort((a, b) => b.rate - a.rate);
+        .sort(cfg.newestSingle
+          ? ((a, b) => (b.course.created - a.course.created) || (Number(b.course.id) - Number(a.course.id)))
+          : ((a, b) => b.rate - a.rate));
 
-      log('\n──── 最快攒学时选课计划(按「学分 ÷ 全片时长」排序)────');
-      log(`候选 ${ranked.length} 门(可播放的没学满的 Mp4 课)`);
+      log(cfg.newestSingle
+        ? '\n──── 单视频课选课计划(按「发布时间从新到旧」排序)────'
+        : '\n──── 最快攒学时选课计划(按「学分 ÷ 全片时长」排序)────');
+      log(`候选 ${ranked.length} 门(${cfg.newestSingle ? '可播放的没学满的单视频课' : '可播放的没学满的 Mp4 课'})`);
       let credit2 = 0, sec = 0, n = 0;
       const target = Math.min(isFinite(cfg.targetCredit) ? cfg.targetCredit : 5, 5);
       for (const p of ranked) {
@@ -1029,6 +1064,7 @@ async function main() {
       }
       ranked.slice(0, 20).forEach((p, i) => {
         log(`  ${String(i + 1).padStart(3)}. ${p.rate.toFixed(2).padStart(6)} 学时/小时  ${p.course.credit} 学分 / 全片 ${(p.total / 60).toFixed(1)} 分钟` +
+          `${cfg.newestSingle ? `  发布 ${fmtDate(p.course.created)}` : ''}` +
           `${p.coming ? ` (已看 ${p.donePct.toFixed(0)}%,需播 ${(p.remain / 60).toFixed(1)} 分)` : ''}  ${p.course.type}/${p.course.standards}  《${p.course.name.slice(0, 30)}》`);
       });
       if (ranked.length > 20) log(`  … 以及另外 ${ranked.length - 20} 门`);
@@ -1069,6 +1105,7 @@ async function main() {
         const needsWork = c => {
           if (!isVideo(c)) return false;
           if (!(c.credit > 0)) return false;   // 不给学分的课不值得花时间
+          if (cfg.newestSingle && !isSingleVideo(c)) return false;  // --newest-single:只要单视频课
           if (isUnselected(c)) return true;
           const rec = mineNow.get(c.id);
           return !!rec && rec.browseScore < 100;
@@ -1078,7 +1115,12 @@ async function main() {
           .filter(c => !skipThisRun.has(c.id))
           .filter(c => !(state.courses[c.id] && state.courses[c.id].failed))
           .map(c => rankCourse(c, mineNow.get(c.id), state))
-          .sort((a, b) => (b.rate - a.rate) || (b.course.required - a.course.required) || (a.remain - b.remain));
+          .sort(cfg.newestSingle
+            // --newest-single:发布时间从新到旧;同一天的按课程 Id 从大到小(站点按发布顺序递增)
+            ? ((a, b) => (b.course.created - a.course.created)
+                || (Number(b.course.id) - Number(a.course.id))
+                || (a.remain - b.remain))
+            : ((a, b) => (b.rate - a.rate) || (b.course.required - a.course.required) || (a.remain - b.remain)));
         if (!pending.length) {
           log('\n没有需要继续学习的视频课程了。');
           break;
@@ -1086,10 +1128,13 @@ async function main() {
         course = pending[0].course;
         picked = pending[0];
         if (pending.length > 1) {
-          log(`  选课策略: 按「学分 ÷ 全片时长」排序,当前最优候选:`);
+          log(cfg.newestSingle
+            ? '  选课策略: 按「发布时间从新到旧」排序(只学单视频课),当前候选:'
+            : '  选课策略: 按「学分 ÷ 全片时长」排序,当前最优候选:');
           for (const p of pending.slice(0, 3)) {
             log(`    · ${p.rate.toFixed(2).padStart(6)} 学时/小时  《${p.course.name.slice(0, 22)}》` +
-              ` 学分${p.course.credit} 全片${(p.total / 60).toFixed(1)}分 需播${(p.remain / 60).toFixed(1)}分可拿${p.gain.toFixed(2)}${p.coming ? ` (已看${p.donePct.toFixed(0)}%)` : ''}`);
+              ` 学分${p.course.credit} 全片${(p.total / 60).toFixed(1)}分 需播${(p.remain / 60).toFixed(1)}分可拿${p.gain.toFixed(2)}` +
+              `${cfg.newestSingle ? ` 发布${fmtDate(p.course.created)}` : ''}${p.coming ? ` (已看${p.donePct.toFixed(0)}%)` : ''}`);
           }
         }
       }

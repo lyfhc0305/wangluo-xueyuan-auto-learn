@@ -24,13 +24,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
+. (Join-Path $PSScriptRoot 'native-args.ps1')
 
 $credFile = Join-Path $PSScriptRoot 'accounts.local.json'
 $list = @()
 
-# profile 名脱敏:11 位手机号 → 135＊＊＊＊6716(全角星号,Windows 文件名合法,
-# 半角 * 是 NTFS 保留字符不能用),避免手机号明文出现在
-# state-xxx.json / logs\run-xxx.log / .chrome-profile-xxx 的文件名里
+# 脱敏仅用于显示;原始 profile 交给主程序计算唯一目录标识。
 function Get-MaskedProfile([string]$name) {
   if ($name -match '^1[3-9]\d{9}$') { return $name.Substring(0, 3) + '＊＊＊＊' + $name.Substring(7) }
   return $name
@@ -46,7 +45,7 @@ function Read-InteractiveAccounts {
     $secure = Read-Host '  密码' -AsSecureString
     $pass = [System.Net.NetworkCredential]::new('', $secure).Password
     if (-not $pass) { Write-Host '  密码为空,跳过。' -ForegroundColor Yellow; continue }
-    $acc += [pscustomobject]@{ profile = Get-MaskedProfile $user; user = $user; pass = $pass }
+    $acc += [pscustomobject]@{ profile = $user; user = $user; pass = $pass }
   }
   return $acc
 }
@@ -80,21 +79,23 @@ if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'node_modules'))) {
 
 Write-Host ""
 Write-Host "即将并行启动 $($list.Count) 个账号:" -ForegroundColor Cyan
-foreach ($a in $list) { Write-Host "  · $($a.user)" }
+foreach ($a in $list) { Write-Host "  · $(Get-MaskedProfile $a.user)" }
 
 $started = @()
 foreach ($a in $list) {
-  $argList = @('auto-learn.mjs', "--profile=$($a.profile)", "--user=$($a.user)", "--pass=$($a.pass)")
-  if ($Daily) { $argList += '--daily' } else { $argList += '--credit=5' }
-  $p = Start-Process -FilePath 'node' -ArgumentList $argList -WorkingDirectory $PSScriptRoot -PassThru
+  $profileName = if ($a.profile) { [string]$a.profile } else { [string]$a.user }
+  $argList = @('auto-learn.mjs', "--profile=$profileName", "--user=$($a.user)", "--pass=$($a.pass)")
+  if ($Daily) { $argList += '--daily' }
+  $argLine = ($argList | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' '
+  $p = Start-Process -FilePath 'node' -ArgumentList $argLine -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru
   $started += $p
-  Write-Host "  → 已启动 $($a.user) (PID $($p.Id))" -ForegroundColor Green
+  Write-Host "  → 已启动 $(Get-MaskedProfile $a.user) (PID $($p.Id))" -ForegroundColor Green
 }
 
 Write-Host ""
-Write-Host "两个窗口会各自弹出 Chrome 自动登录并开始播放。" -ForegroundColor Cyan
-Write-Host "⚠ 不要关掉浏览器窗口、不要最小化;关掉终端窗口会中断对应的学习。" -ForegroundColor Yellow
-Write-Host "进度看 logs\run-<账号>-*.log,或等窗口自己结束。" -ForegroundColor Cyan
+Write-Host "各账号会弹出独立浏览器窗口,登录后开始播放。" -ForegroundColor Cyan
+Write-Host "学习进程在后台运行;请保持浏览器打开,按页面要求手动操作。" -ForegroundColor Yellow
+Write-Host "进度看 logs\run-<会话标识>-*.log。需要中止时关闭对应浏览器。" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "本次启动的进程:" -ForegroundColor Cyan
 $started | ForEach-Object { Write-Host ("  PID {0}" -f $_.Id) }

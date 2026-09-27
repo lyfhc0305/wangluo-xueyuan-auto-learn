@@ -35,19 +35,30 @@ const DETECTORS = [
 ];
 
 const TEXT_EXT = /\.(mjs|cjs|js|json|md|txt|bat|cmd|sh|ps1|yml|yaml|html|css)$/i;
+const CREDENTIAL_FILE = /^(?:config(?:\.[^.]+)?|accounts(?:\.local)?)\.json$/i;
+
+function credentialFields(value, prefix = '') {
+  if (!value || typeof value !== 'object') return [];
+  return Object.entries(value).flatMap(([key, item]) => {
+    const field = prefix ? `${prefix}.${key}` : key;
+    if (/^(?:user(?:name)?|account|pass(?:word)?)$/i.test(key) && item != null && String(item).trim() !== '') return [field];
+    return credentialFields(item, field);
+  });
+}
 // 跳过这些目录:
 //   node_modules / .git / _recon  —— 第三方或侦察产物
 //   .chrome-profile*              —— 浏览器会话目录,里面是 Chrome 自带的二进制
 //                                    和资源文件(WasmTtsEngine 的语音包、ZxcvbnData
 //                                    的弱密码字典等),它们自带示例手机号/身份证号,
 //                                    扫了会误报。这个目录单独作为"提醒"列出。
-const SKIP_DIRS = /(^|[\\/])(node_modules|\.git|_recon|\.chrome-profile[^\\/]*)([\\/]|$)/;
+const SKIP_DIRS = /(^|[\\/])(node_modules|\.git|_recon|test|\.chrome-profile[^\\/]*)([\\/]|$)/;
 
 function walk(dir, files = [], dirs = []) {
   for (const d of fs.readdirSync(dir, { withFileTypes: true })) {
     const p = path.join(dir, d.name);
     if (d.isDirectory()) {
-      if (!SKIP_DIRS.test(p)) { dirs.push(p); walk(p, files, dirs); }
+      dirs.push(p);
+      if (!SKIP_DIRS.test(p)) walk(p, files, dirs);
     }
     else files.push(p);
   }
@@ -83,6 +94,18 @@ if (!fs.existsSync(abs)) {
     const rel = path.relative(abs, f);
     if (path.basename(f) === 'privacy-check.mjs') continue;   // 跳过本工具自身(内含探测器正则)
     const text = fs.readFileSync(f, 'utf8');
+    if (CREDENTIAL_FILE.test(path.basename(f))) {
+      try {
+        const fields = credentialFields(JSON.parse(text.replace(/^\uFEFF/, '')));
+        if (fields.length) {
+          HIGH.push([rel, `非空账号/密码字段: ${fields.join(', ')}(值已隐藏)`]);
+          continue; // 不把凭据再次通过手机号等检测器打印到报告。
+        }
+      } catch {
+        HIGH.push([rel, '凭据配置无法解析,无法确认是否含账号密码,分享前请排除或人工检查']);
+        continue;
+      }
+    }
     for (const d of DETECTORS) {
       const hits = [...new Set([...text.matchAll(d.re)].map(m => m[0]))];
       if (hits.length) {
@@ -108,9 +131,17 @@ if (!fs.existsSync(abs)) {
   }
   if (nameHits) console.log(`⚠ 有 ${nameHits} 个文件/目录的【名称】本身含敏感信息(详见下方)\n`);
 
+  for (const dir of dirs) {
+    if (/^\.chrome-profile/i.test(path.basename(dir))) {
+      HIGH.push([path.relative(abs, dir), '浏览器会话目录可能含 Cookie 和保存的密码,分享前请排除']);
+    }
+  }
+
   // 隐藏文件
   for (const d of fs.readdirSync(abs, { withFileTypes: true })) {
-    if (/^(\.chrome-profile|logs|state\.json)$/.test(d.name)) {
+    if (/^\.chrome-profile/i.test(d.name)) {
+      // 已作为高危目录报告。
+    } else if (/^(logs|state(?:-.+)?\.json)$/.test(d.name)) {
       INFO.push([d.name, d.isDirectory() ? '运行时生成的目录(含登录态/日志),分享前请排除' : '运行时生成的进度文件,含你学过的课程名']);
     } else if (/^\.|Thumbs\.db|desktop\.ini|\.DS_Store/i.test(d.name)) {
       MED.push([d.name, '隐藏/系统文件']);
@@ -145,8 +176,10 @@ if (process.exitCode === 2) {
     process.exitCode = 1;
   } else if (MED.length) {
     console.log(' 结论:无高危内容;中危项请自行确认是否可接受。');
+  } else if (INFO.length) {
+    console.log(' 结论:请先检查并排除上述运行时生成物后再分享。');
   } else {
-    console.log(' 结论:✔ 未发现个人数据,可以放心分享。');
+    console.log(' 结论:未命中已知敏感内容规则,分享前仍需确认文件范围。');
   }
   console.log(' 注意:Cookie、令牌一般存在二进制文件里,本工具查不到明文,');
   console.log('       所以请务必确认没有把 .chrome-profile 一起发出去。');
