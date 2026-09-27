@@ -212,7 +212,7 @@ function findBrowser() {
 function killLeftoverChrome() {
   try {
     if (process.platform === 'win32') {
-      const ps = `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -like '*${PROFILE_DIR.replace(/'/g, "''")}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
+      const ps = `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -and ($_.CommandLine.IndexOf('${PROFILE_DIR.replace(/'/g, "''")}', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
       execSync(`powershell -NoProfile -Command "${ps}"`, { stdio: 'ignore', timeout: 30000 });
     } else {
       execSync(`pkill -f ${JSON.stringify(PROFILE_DIR)} || true`, { stdio: 'ignore', timeout: 30000, shell: '/bin/sh' });
@@ -306,6 +306,41 @@ async function loginFormNeedsCaptcha(page) {
   });
 }
 
+async function solveLoginCaptchaWithOcr(imageBuffer) {
+  const pythonCandidates = [
+    'D:\\Program Files\\python314\\python.exe',
+    'python.exe',
+    'python',
+  ];
+  const pyCode = `
+import sys
+try:
+    import ddddocr
+    ocr = ddddocr.DdddOcr(show_ad=False)
+    data = sys.stdin.buffer.read()
+    res = ocr.classification(data)
+    print(res.strip())
+except Exception as e:
+    sys.exit(1)
+`;
+
+  for (const py of pythonCandidates) {
+    try {
+      const env = { ...process.env, PYTHONPATH: 'D:\\Program Files\\python314\\Lib\\site-packages' };
+      const output = execSync(`"${py}" -c "${pyCode.replace(/\n/g, ' ')}"`, {
+        input: imageBuffer,
+        env,
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'ignore'],
+        encoding: 'utf8'
+      });
+      const text = output.trim();
+      if (text && text.length >= 4) return text.slice(0, 4);
+    } catch {}
+  }
+  return null;
+}
+
 async function fillLoginForm(page, username, password) {
   return await page.evaluate((username, password) => {
     const setVal = (el, v) => {
@@ -358,7 +393,56 @@ async function ensureLoggedIn(page, cfg) {
       log('  ✖ 自动登录未成功(可能需要验证码/滑块),请手动完成');
       await openLoginModal(page);
     } else {
-      log('  ⚠ 该账号需要图形验证码,请手动输入');
+      log('  ⚠ 检测到图形验证码,正在尝试使用 OCR 自动识别…');
+      let ocrSuccess = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const codeImg = await page.$('#loginModal img.codeImg');
+          if (!codeImg) break;
+          const imgBuf = await codeImg.screenshot();
+          const codeText = await solveLoginCaptchaWithOcr(imgBuf);
+          if (codeText) {
+            log(`    第 ${attempt} 次识别验证码: ${codeText},正在提交…`);
+            await page.evaluate((val) => {
+              const input = document.querySelector('#loginModal input[ng-model="login.ValidateCode"]');
+              if (input) {
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                setter.call(input, val);
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                if (window.angular) {
+                  try {
+                    const sc = window.angular.element(input).scope();
+                    if (sc && sc.login) { sc.login.ValidateCode = val; sc.$apply(); }
+                  } catch {}
+                }
+              }
+            }, codeText);
+            await sleep(500);
+            await clickLoginButton(page);
+            await sleep(3500);
+            if (await isLoggedIn(page)) {
+              log('  ✔ 验证码识别通过,登录成功！');
+              ocrSuccess = true;
+              autoSubmitted = true;
+              return true;
+            }
+            // 登录失败，刷新验证码
+            await openLoginModal(page);
+            await sleep(1000);
+            const refreshImg = await page.$('#loginModal img.codeImg');
+            if (refreshImg) await refreshImg.click();
+            await sleep(1500);
+          } else {
+            log(`    第 ${attempt} 次未识别出有效验证码`);
+          }
+        } catch (e) {
+          log(`    第 ${attempt} 次尝试 OCR 异常: ${e.message}`);
+        }
+      }
+      if (!ocrSuccess) {
+        log('  ⚠ OCR 自动识别未成功,请手动在弹窗中完成');
+      }
     }
   }
 
