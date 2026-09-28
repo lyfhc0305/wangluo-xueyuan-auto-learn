@@ -817,6 +817,10 @@ async function readVideoState(page) {
 }
 
 async function ensurePlaying(page, mute = true) {
+  try { return await ensurePlayingInner(page, mute); } catch { return false; }
+}
+
+async function ensurePlayingInner(page, mute = true) {
   return await page.evaluate(m => {
     const v = document.querySelector('video');
     if (!v) return false;
@@ -908,12 +912,23 @@ async function playCourse(browser, cfg, course, mainPage) {
   log(`    视频总时长 ${fmtTime(duration)}(从 ${fmtTime(startAt)} 继续),预计需要 ${fmtTime(remain)}`);
 
   const hardDeadline = Date.now() + remain * 1000 * cfg.maxDurationFactor + cfg.maxExtraMinutes * 60 * 1000;
-  let lastLog = 0, lastPos = startAt, stalledSince = 0, quizNotified = false;
+  let lastLog = 0, lastPos = startAt, stalledSince = 0, quizNotified = false, detachedRetries = 0;
   let stalledStage25 = false, stalledStage50 = false, stalledStage80 = false;
 
   while (true) {
     await sleep(2000);
     st = await readVideoState(player);
+
+    // Frame 游离(页面被重载/关闭/导航)时不要当成播放结束:先重试几轮,
+    // 持续游离才判定为可重试失败,否则会把没播完的课误记为已完成。
+    if (st.detached) {
+      detachedRetries++;
+      if (detachedRetries <= 5) { log(`  ⚠ 播放页 Frame 游离,重试中(${detachedRetries}/5)…`); continue; }
+      log('  ✖ 播放页 Frame 持续游离,关闭本门课程稍后重试');
+      await player.close().catch(() => {});
+      return { ok: false, reason: 'detached-frame', retryable: true, duration };
+    }
+    detachedRetries = 0;
 
     if (!st.hasVideo) { log('  ⚠ 视频元素消失,视为播放结束'); break; }
 
