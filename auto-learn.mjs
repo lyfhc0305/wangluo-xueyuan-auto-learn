@@ -309,33 +309,23 @@ async function loginFormNeedsCaptcha(page) {
 
 async function solveLoginCaptchaWithOcr(imageBuffer) {
   const pythonCandidates = [
-    'D:\\Program Files\\python314\\python.exe',
+    'D:/Program Files/python314/python.exe',
     'python.exe',
     'python',
   ];
-  const pyCode = `
-import sys
-try:
-    import ddddocr
-    ocr = ddddocr.DdddOcr(show_ad=False)
-    data = sys.stdin.buffer.read()
-    res = ocr.classification(data)
-    print(res.strip())
-except Exception as e:
-    sys.exit(1)
-`;
+  const pyCode = 'import sys, ddddocr; ocr = ddddocr.DdddOcr(show_ad=False); print(ocr.classification(sys.stdin.buffer.read()).strip())';
 
   for (const py of pythonCandidates) {
     try {
-      const env = { ...process.env, PYTHONPATH: 'D:\\Program Files\\python314\\Lib\\site-packages' };
-      const output = execSync(`"${py}" -c "${pyCode.replace(/\n/g, ' ')}"`, {
+      const env = { ...process.env, PYTHONPATH: 'D:/Program Files/python314/Lib/site-packages' };
+      const output = execFileSync(py, ['-c', pyCode], {
         input: imageBuffer,
         env,
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'ignore'],
         encoding: 'utf8'
       });
-      const text = output.trim();
+      const text = (output || '').trim();
       if (text && text.length >= 4) return text.slice(0, 4);
     } catch {}
   }
@@ -807,19 +797,23 @@ async function solvePlayGate(page, maxAttempts = 5) {
 }
 
 async function readVideoState(page) {
-  return await page.evaluate(() => {
-    const v = document.querySelector('video');
-    if (!v) return { hasVideo: false };
-    const qm = document.querySelector('.questionModal');
-    const quizOpen = !!(qm && qm.classList.contains('in') && getComputedStyle(qm).display !== 'none');
-    return {
-      hasVideo: true,
-      duration: Number.isFinite(v.duration) ? v.duration : 0,
-      currentTime: Number(v.currentTime) || 0,
-      paused: v.paused, ended: v.ended,
-      muted: v.muted, playbackRate: v.playbackRate, quizOpen,
-    };
-  });
+  try {
+    return await page.evaluate(() => {
+      const v = document.querySelector('video');
+      if (!v) return { hasVideo: false };
+      const qm = document.querySelector('.questionModal');
+      const quizOpen = !!(qm && qm.classList.contains('in') && getComputedStyle(qm).display !== 'none');
+      return {
+        hasVideo: true,
+        duration: Number.isFinite(v.duration) ? v.duration : 0,
+        currentTime: Number(v.currentTime) || 0,
+        paused: v.paused, ended: v.ended,
+        muted: v.muted, playbackRate: v.playbackRate, quizOpen,
+      };
+    });
+  } catch (e) {
+    return { hasVideo: false, detached: true };
+  }
 }
 
 async function ensurePlaying(page, mute = true) {
@@ -940,7 +934,8 @@ async function playCourse(browser, cfg, course, mainPage) {
       break;
     }
 
-    if (Math.abs(st.currentTime - lastPos) < 0.4) {
+    const hasProgress = st.currentTime > lastPos + 0.8;
+    if (!hasProgress) {
       if (!stalledSince) stalledSince = Date.now();
       const stallDuration = Date.now() - stalledSince;
       if (!st.quizOpen) {
