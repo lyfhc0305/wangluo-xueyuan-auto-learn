@@ -34,6 +34,24 @@ test('parseAccountLog correctly parses credit, progress, and daily limit status'
   assert.equal(res.finishedCount, 1);
 });
 
+test('parseAccountLog captures initial credit from startup progress line', t => {
+  const dir = temporaryDirectory(t);
+  const logFile = path.join(dir, 'run-startup.log');
+  const content = `
+[08:00:00] 当前进度: 学时/学分 48.25 (来源 MyStudyStat.CreditSum) | 已完成 10 门,未完成 2 门,累计 12 门
+[08:00:01] ──────── 第 1 门 ────────
+[08:00:01] 《课程一》 id=101 学分=1 进度=-1
+[08:10:05]   ✔ 该课程已学完,学分已到账
+[08:10:06]   当前学时/学分: 49.25 (来源 MyStudyStat.CreditSum)
+[08:10:10] 结束。本次处理 1 门,学时/学分 49.25
+`;
+  fs.writeFileSync(logFile, content, 'utf8');
+  const res = parseAccountLog(logFile);
+  assert.equal(res.initialCredit, 48.25);
+  assert.equal(res.currentCredit, 49.25);
+  assert.equal(res.finishedCount, 1);
+});
+
 test('formatDashboard and formatSummaryReport produce clean formatted output', () => {
   const rows = [
     {

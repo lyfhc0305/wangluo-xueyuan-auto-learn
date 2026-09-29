@@ -66,6 +66,13 @@ export function parseAccountLog(logFilePath) {
 
   for (const line of lines) {
     // 学分提取
+    // ⚠ 启动时的首行是「当前进度: 学时/学分 X」(全角冒号),而结算行是「当前学时/学分: X」。
+    //   只认后者会把基准取成"第一门结算后"的值,看板增量凭空少算一门(如实际 +1.72 显示 +1.00)。
+    const pm = /当前进度:\s*学时\/学分\s*([\d.]+)/.exec(line);
+    if (pm && initialCredit === null) {
+      initialCredit = parseFloat(pm[1]);
+      if (currentCredit === null) currentCredit = initialCredit;
+    }
     const cm = /当前学时\/学分:\s*([\d.]+)/.exec(line);
     if (cm) {
       const val = parseFloat(cm[1]);
@@ -207,8 +214,11 @@ async function runBatch() {
   const startTime = Date.now();
   const children = [];
 
+  if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+
   for (const acc of accounts) {
     const profile = acc.profile || acc.user;
+    const paths = resolveProfilePaths(ROOT, profile, acc.user);
     const childArgs = [
       'auto-learn.mjs',
       `--profile=${profile}`,
@@ -217,10 +227,20 @@ async function runBatch() {
       '--newest-single',
       '--daily'
     ];
+    const errLogFile = path.join(LOG_DIR, `err-${paths.name}.log`);
+    const errFd = fs.openSync(errLogFile, 'a');
     const proc = spawn(process.execPath, childArgs, {
       cwd: ROOT,
-      stdio: ['ignore', 'ignore', 'ignore'],
+      stdio: ['ignore', 'ignore', errFd],
       windowsHide: true,
+    });
+    proc.on('close', code => {
+      try { fs.closeSync(errFd); } catch {}
+      try {
+        if (code === 0 && fs.existsSync(errLogFile) && fs.statSync(errLogFile).size === 0) {
+          fs.unlinkSync(errLogFile);
+        }
+      } catch {}
     });
     children.push({ proc, acc, profile });
     console.log(`  → 已启动账号 ${maskPhone(acc.user)} (PID ${proc.pid})`);
