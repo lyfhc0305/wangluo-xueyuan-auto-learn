@@ -29,10 +29,10 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
+import { execSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer-core';
-import { resolveProfilePaths, isPermanentFailure, nextNoGainStreak, launchProfileBrowser } from './runtime-utils.mjs';
+import { resolveProfilePaths, isPermanentFailure, nextNoGainStreak } from './runtime-utils.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const BASE = 'https://www.hngbwlxy.gov.cn/';
@@ -51,27 +51,34 @@ const optVal = (n, d) => {
 };
 
 /**
- * 会话目录。默认 .chrome-profile;用 --profile=账号 可以给不同账号各建一个,
- * 登录态与 state 文件都按账号独立,多个账号可以并行跑互不干扰。
- *
- * 隐私:profile 名如果本身就是手机号(直接 --profile=138xxxxxxxx 运行时很常见),
- * 会原样出现在 state-xxx.json / logs\run-xxx.log / .chrome-profile-xxx 的文件名
- * 和日志正文里。这里在入口统一打码成 138＊＊＊＊6693(全角星号,NTFS 文件名合法,
- * 半角 * 是保留字符),与 并行学习.ps1 的 Get-MaskedProfile 行为一致。
+ * 会话目录与状态文件。
+ * 遵循 runtime-utils.mjs 的唯一标识与脱敏规范,附加 SHA-256 摘要隔离各账号。
  */
 const rawProfile = String(optVal('profile', '') || '').trim();
-const PROFILE_NAME = rawProfile.replace(/^(1[3-9]\d)\d{4}(\d{4})$/, '$1＊＊＊＊$2');
-const PROFILE_DIR = PROFILE_NAME
-  ? path.join(ROOT, `.chrome-profile-${PROFILE_NAME.replace(/[\\/:*?"<>|]/g, '_')}`)
-  : path.join(ROOT, '.chrome-profile');
+const cliUser = String(optVal('user', '') || '').trim();
+const resolvedPaths = resolveProfilePaths(ROOT, rawProfile, cliUser);
+const PROFILE_NAME = resolvedPaths.name;
+let PROFILE_DIR = resolvedPaths.directory;
+STATE_FILE = resolvedPaths.stateFile;
 
-/**
- * 多账号并行时,state 也要按账号分开。
- * 否则 A 账号选课失败被标成 failed 的课程,B 账号会被直接跳过(见主流程里的
- * `!(state.courses[c.id] && state.courses[c.id].failed)` 过滤)。
- */
+// 兼容迁移：若已有旧版无哈希会话目录或状态文件存在且新位置未建立，自动迁移复用
 if (PROFILE_NAME) {
-  STATE_FILE = path.join(ROOT, `state-${PROFILE_NAME.replace(/[\\/:*?"<>|]/g, '_')}.json`);
+  const legacyDir = path.join(ROOT, `.chrome-profile-${PROFILE_NAME.replace(/[\\/:*?"<>|]/g, '_')}`);
+  const legacyState = path.join(ROOT, `state-${PROFILE_NAME.replace(/[\\/:*?"<>|]/g, '_')}.json`);
+  if (!fs.existsSync(PROFILE_DIR) && fs.existsSync(legacyDir)) {
+    try {
+      fs.renameSync(legacyDir, PROFILE_DIR);
+    } catch {
+      PROFILE_DIR = legacyDir;
+    }
+  }
+  if (!fs.existsSync(STATE_FILE) && fs.existsSync(legacyState)) {
+    try {
+      fs.renameSync(legacyState, STATE_FILE);
+    } catch {
+      STATE_FILE = legacyState;
+    }
+  }
 }
 
 const DEFAULT_CONFIG = {
@@ -247,6 +254,9 @@ async function preparePage(page, cfg) {
 // ───────────────────────────── 站点接口 ─────────────────────────────
 
 async function api(page, apiPath, data = {}) {
+  // ⚠ page.evaluate 本身也可能抛(页面被关/导航导致的 detached Frame),必须在外层兜住,
+  //   否则异常会穿过 api() → fetchMyCourses() → main(),把整轮(多账号)运行直接打断。
+  try {
   return await page.evaluate(async (apiPath, data) => {
     const body = new URLSearchParams();
     for (const [k, v] of Object.entries(data || {})) body.append(k, v == null ? '' : String(v));
@@ -267,6 +277,9 @@ async function api(page, apiPath, data = {}) {
       return { status: 0, ok: false, json: null, text: 'fetch failed: ' + e.message };
     }
   }, apiPath, data);
+  } catch (e) {
+    return { status: 0, ok: false, json: null, text: 'evaluate-failed: ' + ((e && e.message) || e) };
+  }
 }
 
 async function getAntiForgeryToken(page) {
@@ -309,18 +322,27 @@ async function loginFormNeedsCaptcha(page) {
 
 async function solveLoginCaptchaWithOcr(imageBuffer) {
   const pythonCandidates = [
+    process.env.PYTHON_PATH,
     'D:/Program Files/python314/python.exe',
     'python.exe',
+    'python3',
     'python',
-  ];
+    process.platform === 'win32' ? 'py' : null,
+  ].filter(Boolean);
   const pyCode = 'import sys, ddddocr; ocr = ddddocr.DdddOcr(show_ad=False); print(ocr.classification(sys.stdin.buffer.read()).strip())';
+
+  // 保留特定历史路径(若存在), 同时不强制覆盖常规 site-packages
+  const extraPyPath = 'D:/Program Files/python314/Lib/site-packages';
+  const customEnv = { ...process.env };
+  if (fs.existsSync(extraPyPath)) {
+    customEnv.PYTHONPATH = customEnv.PYTHONPATH ? `${extraPyPath}${path.delimiter}${customEnv.PYTHONPATH}` : extraPyPath;
+  }
 
   for (const py of pythonCandidates) {
     try {
-      const env = { ...process.env, PYTHONPATH: 'D:/Program Files/python314/Lib/site-packages' };
       const output = execFileSync(py, ['-c', pyCode], {
         input: imageBuffer,
-        env,
+        env: customEnv,
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'ignore'],
         encoding: 'utf8'
@@ -620,6 +642,20 @@ async function enrollCourses(page, ids) {
   if (token) data[token.name] = token.value;
   const r = await api(page, 'Page/AddStudyCourse', data);
   return r.json;
+}
+
+// ─────────────────────── 学习统计读取(容错) ───────────────────────
+
+/**
+ * fetchMyCourses 的容错包装:页面/Frame 异常时返回空统计,只告警不抛,
+ * 避免"播放页刚被关掉就复核进度"这类时序问题把整轮运行打断。
+ */
+async function safeMyCourses(page, tag = '') {
+  try { return await fetchMyCourses(page); }
+  catch (e) {
+    log(`  ⚠ 读取学习统计失败${tag ? `(${tag})` : ''}: ${(e && e.message) || e}`);
+    return { map: new Map(), creditSum: 0, count: 0 };
+  }
 }
 
 // ───────────────────────────── 学分 / 学时 ─────────────────────────────
@@ -1280,7 +1316,7 @@ async function main() {
         // 用个人学习统计里的 BrowseScore(0~100)判断"还没学满",这个口径
         // 不受 CourseList.Learning 到底是 0~1 还是 0~100 的影响,最可靠。
         // 只挑 Learning<0 的课会漏掉"已选但没看完"的课,那些课同样不给学分。
-        const mineNow = (await fetchMyCourses(page)).map;
+        const mineNow = (await safeMyCourses(page, '选课前')).map;
         const needsWork = c => {
           if (!isVideo(c)) return false;
           if (!(c.credit > 0)) return false;   // 不给学分的课不值得花时间
@@ -1364,7 +1400,7 @@ async function main() {
       }
 
       // 2) 播放到结束
-      const before = (await fetchMyCourses(page)).map.get(course.id);
+      const before = (await safeMyCourses(page, '播放前')).map.get(course.id);
       const res = await playCourse(browser, cfg, course, page);
       state.courses[course.id] = {
         name: course.name, credit: course.credit, at: new Date().toISOString(),
@@ -1395,7 +1431,7 @@ async function main() {
 
       // 3) 复核:该课程的浏览进度是否到 100
       await sleep(4000);
-      const after = (await fetchMyCourses(page)).map.get(course.id);
+      const after = (await safeMyCourses(page, '复核')).map.get(course.id);
       if (after) {
         const b0 = before ? before.browseScore : '未选课';
         log(`  课程进度复核: BrowseScore ${b0} → ${after.browseScore}, 已得学分 ${after.credit}`);
@@ -1459,4 +1495,4 @@ if (isDirectRun) {
   main();
 }
 
-export { fetchMyCourses, playCourse, main };
+export { fetchMyCourses, playCourse, solveLoginCaptchaWithOcr, main };

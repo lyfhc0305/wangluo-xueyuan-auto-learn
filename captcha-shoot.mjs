@@ -6,7 +6,19 @@ import path from 'node:path';
 import puppeteer from 'puppeteer-core';
 
 const [cmd, profileDir, arg] = process.argv.slice(2);
+if (!cmd || !profileDir || !arg) {
+  console.log('NO_ARGS: 用法: node captcha-shoot.mjs shoot <profileDir> <outfile> 或 fill <profileDir> <code>');
+  process.exit(2);
+}
+if (!fs.existsSync(profileDir)) {
+  console.log('NO_PROFILE_DIR');
+  process.exit(2);
+}
 const portFile = path.join(profileDir, 'DevToolsActivePort');
+if (!fs.existsSync(portFile)) {
+  console.log('NO_DEVTOOLS_PORT');
+  process.exit(2);
+}
 const port = Number(fs.readFileSync(portFile, 'utf8').split('\n')[0].trim());
 const browser = await puppeteer.connect({ browserURL: `http://127.0.0.1:${port}` });
 
