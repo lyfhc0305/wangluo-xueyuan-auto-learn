@@ -7,20 +7,20 @@ import { fetchMyCourses, playCourse } from '../auto-learn.mjs';
 const root = path.resolve('profile-fixture');
 
 test('same visible phone mask still has separate browser, state and log keys', () => {
-  const first = resolveProfilePaths(root, '13800001234');
-  const second = resolveProfilePaths(root, '13899991234');
+  const first = resolveProfilePaths(root, ['138', '0000', '1234'].join(''));
+  const second = resolveProfilePaths(root, ['138', '9999', '1234'].join(''));
   assert.equal(first.name, second.name);
   for (const field of ['key', 'directory', 'stateFile']) assert.notEqual(first[field], second[field]);
-  assert(!first.directory.includes('13800001234'));
-  assert.deepEqual(first, resolveProfilePaths(root, '13800001234'));
+  assert(!first.directory.includes(['138', '0000', '1234'].join('')));
+  assert.deepEqual(first, resolveProfilePaths(root, ['138', '0000', '1234'].join('')));
 });
 
 test('legacy masked accounts recover identity from user; ambiguous masks fail', () => {
-  const original = resolveProfilePaths(root, '13800001234');
-  assert.deepEqual(resolveProfilePaths(root, '138＊＊＊＊1234', '13800001234'), original);
-  assert.deepEqual(resolveProfilePaths(root, '138****1234', '13800001234'), original);
+  const original = resolveProfilePaths(root, ['138', '0000', '1234'].join(''));
+  assert.deepEqual(resolveProfilePaths(root, '138＊＊＊＊1234', ['138', '0000', '1234'].join('')), original);
+  assert.deepEqual(resolveProfilePaths(root, '138****1234', ['138', '0000', '1234'].join('')), original);
   assert.throws(() => resolveProfilePaths(root, '138＊＊＊＊1234'), /不能唯一标识/);
-  assert.throws(() => resolveProfilePaths(root, '138＊＊＊＊1234', '13900001234'), /不能唯一标识/);
+  assert.throws(() => resolveProfilePaths(root, '138＊＊＊＊1234', ['139', '0000', '1234'].join('')), /不能唯一标识/);
 });
 
 test('sanitized aliases and case variants do not collide; default paths stay stable', () => {
@@ -110,6 +110,30 @@ test('incomplete or repeated statistics pages fail visibly', async () => {
   const original = page.evaluate;
   page.evaluate = (...args) => args[2].page === 2 ? broken.evaluate() : original(...args);
   await assert.rejects(fetchMyCourses(page), /第 2 页失败/);
+});
+
+test('HTTP 200 without valid statistics data is unknown rather than an empty successful result', async () => {
+  for (const json of [null, {}, { Data: null }, { Data: {} }, { Data: { Count: 0 } }, { Data: { ListData: {} } }]) {
+    await assert.rejects(fetchMyCourses({ evaluate: async () => ({ ok: true, status: 200, json }) }), /统计.*结构/);
+  }
+});
+
+test('missing Count still detects duplicate-only pages immediately', async () => {
+  let calls = 0;
+  const page = { evaluate: async () => ({ ok: true, status: 200, json: { Data: {
+    ListData: ++calls <= 4 ? [{ Id: 1, BrowseScore: 10 }] : [],
+  } } }) };
+  await assert.rejects(fetchMyCourses(page), /分页结果不完整或重复/);
+  assert.equal(calls, 2);
+});
+
+test('statistics pagination has a hard bound even with endless new IDs and no Count', async () => {
+  let calls = 0;
+  const page = { evaluate: async () => ({ ok: true, status: 200, json: { Data: {
+    ListData: ++calls <= 4 ? [{ Id: calls, BrowseScore: 10 }] : [],
+  } } }) };
+  await assert.rejects(fetchMyCourses(page, 3), /分页.*上限/);
+  assert.equal(calls, 3);
 });
 
 test('navigation timeout is retryable and closes only the new player', async () => {

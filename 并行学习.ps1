@@ -27,14 +27,12 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 
-if ($Status) {
-  & node batch-learn.mjs --status
-  exit 0
-}
-
-if ($Monitor) {
-  & node batch-learn.mjs
-  exit 0
+if ($Status -or $Monitor) {
+  $batchArgs = @('batch-learn.mjs', "--daily=$($Daily.IsPresent.ToString().ToLowerInvariant())", "--max-accounts=$MaxAccounts")
+  foreach ($account in $Accounts) { $batchArgs += "--accounts=$account" }
+  if ($Status) { $batchArgs += '--status' }
+  & node @batchArgs
+  exit $LASTEXITCODE
 }
 . (Join-Path $PSScriptRoot 'native-args.ps1')
 

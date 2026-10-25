@@ -32,7 +32,7 @@ import path from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer-core';
-import { resolveProfilePaths, isPermanentFailure, nextNoGainStreak } from './runtime-utils.mjs';
+import { resolveProfilePaths, isPermanentFailure, nextNoGainStreak, launchProfileBrowser } from './runtime-utils.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const BASE = 'https://www.hngbwlxy.gov.cn/';
@@ -99,8 +99,11 @@ function loadConfig() {
     catch (e) { console.error('config.json 解析失败,已忽略:', e.message); }
   }
   const cfg = { ...DEFAULT_CONFIG, ...fileCfg };
-  cfg.targetCredit = Number(optVal('credit', cfg.targetCredit));
-  if (!isFinite(cfg.targetCredit)) cfg.targetCredit = 5;
+  const targetCredit = optVal('credit', cfg.targetCredit);
+  cfg.targetCredit = Number(targetCredit);
+  if (String(targetCredit).trim() === '' || !Number.isFinite(cfg.targetCredit) || cfg.targetCredit < 0) {
+    throw new Error('--credit 必须是有限非负数(每日模式请使用 --daily)');
+  }
   cfg.only = optVal('only', null);
   if (cfg.only) cfg.only = String(cfg.only);
   // 多账号并行:账号密码可以直接从命令行给(--user=xxx --pass=yyy),
@@ -109,7 +112,12 @@ function loadConfig() {
   const cliPass = optVal('pass', '');
   if (cliUser) cfg.username = String(cliUser);
   if (cliPass) cfg.password = String(cliPass);
-  cfg.maxCoursesPerRun = Number(optVal('max-courses', cfg.maxCoursesPerRun)) || 0;
+  const maxCourses = optVal('max-courses', cfg.maxCoursesPerRun);
+  cfg.maxCoursesPerRun = Number(maxCourses);
+  if (String(maxCourses).trim() === '' || !Number.isFinite(cfg.maxCoursesPerRun)
+      || !Number.isInteger(cfg.maxCoursesPerRun) || cfg.maxCoursesPerRun < 0) {
+    throw new Error('--max-courses 必须是有限非负整数(0 表示不限)');
+  }
   if (hasFlag('no-keep-visible')) cfg.keepVisible = false;
   if (hasFlag('no-mute')) cfg.muteAudio = false;
   cfg.listOnly = hasFlag('list');
@@ -212,22 +220,6 @@ function findBrowser() {
   throw new Error('未找到 Chrome / Edge。请先安装 Chrome,或设置环境变量 CHROME_PATH 指向浏览器可执行文件');
 }
 
-/**
- * 上一个进程异常退出时可能留下占用 profile 的浏览器,导致再次启动报
- * "The browser is already running for ..."。这里只结束命令行里带本项目
- * profile 路径的进程,不会影响使用者自己的浏览器。
- */
-function killLeftoverChrome() {
-  try {
-    if (process.platform === 'win32') {
-      const ps = `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -and ($_.CommandLine.IndexOf('${PROFILE_DIR.replace(/'/g, "''")}', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
-      execSync(`powershell -NoProfile -Command "${ps}"`, { stdio: 'ignore', timeout: 30000 });
-    } else {
-      execSync(`pkill -f ${JSON.stringify(PROFILE_DIR)} || true`, { stdio: 'ignore', timeout: 30000, shell: '/bin/sh' });
-    }
-    return true;
-  } catch { return false; }
-}
 
 async function preparePage(page, cfg) {
   await page.evaluateOnNewDocument((keepVisible) => {
@@ -324,17 +316,16 @@ async function solveLoginCaptchaWithOcr(imageBuffer) {
   const pythonCandidates = [
     process.env.PYTHON_PATH,
     'python.exe',
-    'python.exe',
     'python3',
     'python',
     process.platform === 'win32' ? 'py' : null,
   ].filter(Boolean);
   const pyCode = 'import sys, ddddocr; ocr = ddddocr.DdddOcr(show_ad=False); print(ocr.classification(sys.stdin.buffer.read()).strip())';
 
-  // 保留特定历史路径(若存在), 同时不强制覆盖常规 site-packages
-  const extraPyPath = '';
+  // Optional local runtime settings; never embed a machine-specific Python installation.
+  const extraPyPath = process.env.PYTHON_SITE_PACKAGES;
   const customEnv = { ...process.env };
-  if (fs.existsSync(extraPyPath)) {
+  if (extraPyPath && fs.existsSync(extraPyPath)) {
     customEnv.PYTHONPATH = customEnv.PYTHONPATH ? `${extraPyPath}${path.delimiter}${customEnv.PYTHONPATH}` : extraPyPath;
   }
 
@@ -531,7 +522,7 @@ async function fetchCourses(page, maxPages = 30) {
 }
 
 /** 我的课程与进度: id -> { browseScore, credit } */
-async function fetchMyCourses(page) {
+async function fetchMyCourses(page, maxPages = 100) {
   const m = new Map();
   let firstData = null;
   let expectedTotal = null;
@@ -544,7 +535,10 @@ async function fetchMyCourses(page) {
     if (!r.ok || r.status !== 200) {
       throw new Error(`获取学习统计第 ${p} 页失败(HTTP ${r.status})`);
     }
-    const d = (r.json && r.json.Data) || {};
+    const d = r.json?.Data;
+    if (!d || !Array.isArray(d.ListData)) {
+      throw new Error(`获取学习统计第 ${p} 页结构无效: 缺少 Data/ListData`);
+    }
     if (!firstData) {
       firstData = d;
       expectedTotal = d.Count !== undefined && d.Count !== null && d.Count !== '' ? Number(d.Count) : null;
@@ -562,12 +556,11 @@ async function fetchMyCourses(page) {
       m.set(c.Id, { browseScore: Number(c.BrowseScore) || 0, credit: Number(c.Credit) || 0, name: c.Name });
     }
 
-    if (expectedTotal !== null) {
-      if (m.size >= expectedTotal) break;
-      if (m.size === prevSize) {
-        throw new Error(`获取学习统计分页结果不完整或重复(当前 ${m.size} 条, 预期 ${expectedTotal} 条)`);
-      }
+    if (m.size === prevSize) {
+      throw new Error(`获取学习统计分页结果不完整或重复(当前 ${m.size} 条, 预期 ${expectedTotal ?? '未知'} 条)`);
     }
+    if (expectedTotal !== null && m.size >= expectedTotal) break;
+    if (p >= maxPages) throw new Error(`获取学习统计分页达到安全上限 ${maxPages},完整性未知`);
     p++;
   }
 
@@ -647,14 +640,20 @@ async function enrollCourses(page, ids) {
 // ─────────────────────── 学习统计读取(容错) ───────────────────────
 
 /**
- * fetchMyCourses 的容错包装:页面/Frame 异常时返回空统计,只告警不抛,
- * 避免"播放页刚被关掉就复核进度"这类时序问题把整轮运行打断。
+ * 页面/Frame 异常有界重试。最终仍未知则抛出,绝不能用空统计冒充零课程。
  */
 async function safeMyCourses(page, tag = '') {
-  try { return await fetchMyCourses(page); }
-  catch (e) {
-    log(`  ⚠ 读取学习统计失败${tag ? `(${tag})` : ''}: ${(e && e.message) || e}`);
-    return { map: new Map(), creditSum: 0, count: 0 };
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try { return await fetchMyCourses(page); }
+    catch (cause) {
+      log(`  ⚠ 读取学习统计失败${tag ? `(${tag})` : ''} [${attempt}/3]: ${cause?.message || cause}`);
+      if (attempt === 3) {
+        const error = new Error('学习统计未知: 3 次读取均失败,停止本次运行并保留重试资格', { cause });
+        error.code = 'STATISTICS_UNAVAILABLE';
+        throw error;
+      }
+      await sleep(2000);
+    }
   }
 }
 
@@ -867,6 +866,69 @@ async function ensurePlayingInner(page, mute = true) {
   }, mute);
 }
 
+/** Per-course wall-clock monitor; small intermittent advances must not reset its window. */
+function createPlaybackMonitor({ now = Date.now(), currentTime = 0, recoveryPending = false } = {}) {
+  let baseline = null, previous = { now, currentTime }, graceUntil = now + 30000;
+  let slow = 0, good = 0, reloaded = false, incident = recoveryPending;
+  return {
+    sample(st) {
+      const none = { action: 'none' };
+      const elapsed = st.now - previous.now;
+      const advance = st.currentTime - previous.currentTime;
+      previous = { now: st.now, currentTime: st.currentTime };
+      if (!st.hasVideo || st.quizOpen || st.ended || !Number.isFinite(st.currentTime) || elapsed <= 0 || elapsed > 90000 || advance < -1 || advance > elapsed / 1000 * 1.5 + 2) {
+        baseline = null; slow = 0; good = 0; graceUntil = st.now + 30000; return none;
+      }
+      if (st.now < graceUntil) return none;
+      if (!baseline) { baseline = { now: st.now, currentTime: st.currentTime }; return none; }
+      const span = st.now - baseline.now;
+      if (span < 60000) return none;
+      const ratio = Math.max(0, (st.currentTime - baseline.currentTime) / (span / 1000));
+      baseline = { now: st.now, currentTime: st.currentTime };
+      slow = ratio < 0.6 ? slow + 1 : 0;
+      good = ratio >= 0.85 ? good + 1 : 0;
+      if (slow >= 2) {
+        slow = 0; good = 0; incident = true;
+        if (reloaded) return { action: 'restart', ratio };
+        reloaded = true;
+        baseline = null; graceUntil = st.now + 30000;
+        return { action: 'reload', ratio };
+      }
+      if (incident && good >= 2) { incident = false; return { action: 'recovered', ratio }; }
+      return { action: 'none', ratio };
+    }
+  };
+}
+
+async function reloadPlaybackMedia(page, mute = true) {
+  try {
+    return await page.evaluate(async muteAudio => {
+      const v = document.querySelector('video');
+      if (!v || v.ended || !Number.isFinite(v.duration)) return { ok: false };
+      const position = v.currentTime;
+      return await new Promise(resolve => {
+        const finish = ok => { clearTimeout(timer); v.removeEventListener('loadedmetadata', restore); resolve({ ok, position }); };
+        const restore = () => {
+          try { v.currentTime = position; if (muteAudio) v.muted = true; v.playbackRate = 1; v.play().then(() => finish(true), () => finish(false)); }
+          catch { finish(false); }
+        };
+        const timer = setTimeout(() => finish(false), 15000);
+        v.addEventListener('loadedmetadata', restore, { once: true });
+        try { v.load(); } catch { finish(false); }
+      });
+    }, mute);
+  } catch { return { ok: false }; }
+}
+
+async function playbackEvent(cfg, course, kind, ratio) {
+  log(`  PLAYBACK_HEALTH=${kind} course=${course.id} speed=${Number.isFinite(ratio) ? ratio.toFixed(2) : 'unknown'}`);
+  if (!cfg.username) return;
+  try {
+    const { recordPlaybackEvent } = await import('./learning-watchdog.mjs');
+    recordPlaybackEvent(ROOT, { profile: rawProfile || cfg.username, user: cfg.username }, { kind, courseId: course.id, ratio });
+  } catch { log('  ⚠ 卡顿事件通知持久化失败，事件仍保留在学习日志中。'); }
+}
+
 async function playCourse(browser, cfg, course, mainPage) {
   const player = await browser.newPage();
   await preparePage(player, cfg);
@@ -947,13 +1009,19 @@ async function playCourse(browser, cfg, course, mainPage) {
   log(`  ▶ 开始播放《${course.name}》`);
   log(`    视频总时长 ${fmtTime(duration)}(从 ${fmtTime(startAt)} 继续),预计需要 ${fmtTime(remain)}`);
 
-  const hardDeadline = Date.now() + remain * 1000 * cfg.maxDurationFactor + cfg.maxExtraMinutes * 60 * 1000;
+  let hardDeadline = Date.now() + remain * 1000 * cfg.maxDurationFactor + cfg.maxExtraMinutes * 60 * 1000;
+  let lastTick = Date.now(), quizWaitMs = 0;
+  const maxQuizWaitMs = 10 * 60 * 1000; // 单门课累计人工答题等待,独立于播放预算
   let lastLog = 0, lastPos = startAt, stalledSince = 0, quizNotified = false, detachedRetries = 0;
   let stalledStage25 = false, stalledStage50 = false, stalledStage80 = false;
+  const playbackMonitor = createPlaybackMonitor({ now: Date.now(), currentTime: startAt, recoveryPending: cfg.playbackRecovery === true });
 
   while (true) {
     await sleep(2000);
     st = await readVideoState(player);
+    const elapsed = Date.now() - lastTick;
+    lastTick = Date.now();
+    const playbackDecision = playbackMonitor.sample({ ...st, now: Date.now() });
 
     // Frame 游离(页面被重载/关闭/导航)时不要当成播放结束:先重试几轮,
     // 持续游离才判定为可重试失败,否则会把没播完的课误记为已完成。
@@ -966,8 +1034,16 @@ async function playCourse(browser, cfg, course, mainPage) {
     }
     detachedRetries = 0;
 
-    if (!st.hasVideo) { log('  ⚠ 视频元素消失,视为播放结束'); break; }
+    if (!st.hasVideo) {
+      log('  ⚠ 视频元素消失,无法确认播放完成,稍后重试');
+      await player.close().catch(() => {});
+      return { ok: false, reason: 'video-disappeared', retryable: true, duration };
+    }
 
+    if (st.quizOpen || quizNotified) {
+      hardDeadline += elapsed;
+      quizWaitMs += elapsed;
+    }
     if (st.quizOpen && !quizNotified) {
       quizNotified = true;
       log('');
@@ -978,11 +1054,50 @@ async function playCourse(browser, cfg, course, mainPage) {
       log('');
       try { await player.bringToFront(); } catch {}
     }
-    if (!st.quizOpen && quizNotified) { quizNotified = false; log('  ✔ 答题完成,继续播放'); }
+    if (st.quizOpen) {
+      stalledSince = 0;
+      stalledStage25 = stalledStage50 = stalledStage80 = false;
+      if (quizWaitMs >= maxQuizWaitMs) {
+        log('  ⚠ 人工答题等待累计达到 10 分钟,停止并等待人工处理');
+        await player.close().catch(() => {});
+        return { ok: false, reason: 'quiz-timeout', retryable: true, manualRequired: true, duration };
+      }
+      continue;
+    }
+    if (quizNotified) {
+      quizNotified = false;
+      stalledSince = Date.now() + 30000; // 答完后给媒体流 30 秒恢复宽限
+      lastPos = st.currentTime;
+      hardDeadline += 30000;
+      log('  ✔ 答题完成,继续播放(恢复宽限 30 秒)');
+      await ensurePlaying(player, cfg.muteAudio);
+    }
 
     if (st.ended || (st.duration && st.currentTime >= st.duration - 1.2)) {
       log(`  ✔ 播放完毕(${fmtTime(st.currentTime)} / ${fmtTime(st.duration)})`);
       break;
+    }
+
+    if (playbackDecision.action === 'recovered') {
+      log('  ✔ 卡顿恢复已确认：连续两个60秒窗口达到正常播放速度');
+      await playbackEvent(cfg, course, 'recovered', playbackDecision.ratio);
+    }
+    if (playbackDecision.action === 'reload') {
+      log('  ⚠ 连续两个60秒窗口播放速度低于60%，重载当前媒体并恢复已看位置');
+      await playbackEvent(cfg, course, 'reload', playbackDecision.ratio);
+      const reloaded = await reloadPlaybackMedia(player, cfg.muteAudio);
+      if (!reloaded?.ok) playbackDecision.action = 'restart';
+      else {
+        stalledSince = 0; stalledStage25 = false; stalledStage50 = false; stalledStage80 = false;
+        lastPos = st.currentTime;
+        continue;
+      }
+    }
+    if (playbackDecision.action === 'restart') {
+      log('  ✖ 重载后仍持续低速或媒体重载失败，请求仅重启当前账号（受监控限频保护）');
+      await playbackEvent(cfg, course, 'restart', playbackDecision.ratio);
+      await player.close().catch(() => {});
+      return { ok: false, reason: 'slow-playback', retryable: true, restartRequired: true, duration };
     }
 
     const hasProgress = st.currentTime > lastPos + 0.8;
@@ -992,23 +1107,13 @@ async function playCourse(browser, cfg, course, mainPage) {
       if (!st.quizOpen) {
         if (stallDuration > 120000) {
           log('  ✖ 播放停滞超过 120 秒且尝试恢复无效,看门狗介入: 关闭本门课程稍后重试');
+          await playbackEvent(cfg, course, 'restart', 0);
           await player.close().catch(() => {});
-          return { ok: false, reason: 'stalled-watchdog', retryable: true, duration };
+          return { ok: false, reason: 'stalled-watchdog', retryable: true, restartRequired: true, duration };
         } else if (stallDuration > 80000 && !stalledStage80) {
           stalledStage80 = true;
           log('  ⚠ 播放持续停滞(80s),重载视频媒体流…');
-          await player.evaluate(m => {
-            const v = document.querySelector('video');
-            if (!v) return;
-            try {
-              if (m) v.muted = true;
-              const cur = v.currentTime;
-              v.load();
-              v.currentTime = cur;
-              const p = v.play();
-              if (p && p.catch) p.catch(() => {});
-            } catch {}
-          }, cfg.muteAudio).catch(() => {});
+          await reloadPlaybackMedia(player, cfg.muteAudio);
         } else if (stallDuration > 50000 && !stalledStage50) {
           stalledStage50 = true;
           log('  ⚠ 播放持续停滞(50s),微调播放进度触发解码与缓冲重试…');
@@ -1074,6 +1179,11 @@ async function playCourse(browser, cfg, course, mainPage) {
   await player.close().catch(() => {});
   log('  ✔ 已关闭播放窗口');
   try { await mainPage.bringToFront(); } catch {}
+  if (!Number.isFinite(finalScore) || finalScore < 100) {
+    const reason = Number.isFinite(finalScore) ? 'progress-incomplete' : 'progress-unknown';
+    log(`  ⚠ 服务端完成进度未确认(${reason}),本次跳过,稍后重试`);
+    return { ok: false, reason, retryable: true, duration, browseScore: finalScore };
+  }
   return { ok: true, duration, browseScore: finalScore };
 }
 
@@ -1149,7 +1259,7 @@ async function performLogout(page) {
 async function main() {
   const cfg = loadConfig();
   if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
-  const logFile = path.join(LOG_DIR, `run-${PROFILE_NAME ? PROFILE_NAME.replace(/[\\/:*?"<>|]/g, '_') + '-' : ''}${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.log`);
+  const logFile = path.join(LOG_DIR, `run-${resolvedPaths.key ? resolvedPaths.key + '-' : ''}${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.log`);
 
   if (hasFlag('reset-profile') && fs.existsSync(PROFILE_DIR)) {
     fs.rmSync(PROFILE_DIR, { recursive: true, force: true });
@@ -1189,16 +1299,7 @@ async function main() {
     ],
   };
 
-  let browser;
-  try {
-    browser = await puppeteer.launch(launchOpts);
-  } catch (e) {
-    if (!/already running for/i.test(String(e.message))) throw e;
-    log('⚠ 检测到上次运行残留的浏览器仍占用配置目录,正在清理…');
-    killLeftoverChrome();
-    await sleep(3000);
-    browser = await puppeteer.launch(launchOpts);
-  }
+  const browser = await launchProfileBrowser(puppeteer, launchOpts);
 
   const page = (await browser.pages())[0] || await browser.newPage();
   await preparePage(page, cfg);
@@ -1214,7 +1315,7 @@ async function main() {
 
     await ensureLoggedIn(page, cfg);
 
-    const mine = await fetchMyCourses(page);
+    const mine = await safeMyCourses(page, '启动');
     let credit = await getCredit(page);
     log(`当前进度: 学时/学分 ${credit.value} (来源 ${credit.source}) | 已完成 ${mine.finish} 门,未完成 ${mine.unfinish} 门,累计 ${mine.count} 门`);
 
@@ -1247,11 +1348,12 @@ async function main() {
         .forEach((c, i) => log(`  ${String(i + 1).padStart(3)}. [${c.id}] ${c.name}  学分 ${c.credit}  时长参考 ${c.time}` +
           `${cfg.newestSingle ? `  发布 ${fmtDate(c.created)}` : ''}`));
       if (pending.length > 60) log(`  … 以及另外 ${pending.length - 60} 门`);
+      log('LEARNING_STOP_REASON=completed');
       return;
     }
 
     if (cfg.plan) {
-      const mineNow = (await fetchMyCourses(page)).map;
+      const mineNow = (await safeMyCourses(page, '计划')).map;
       const ranked = courses
         .filter(isVideo)
         .filter(c => c.credit > 0)
@@ -1284,11 +1386,13 @@ async function main() {
       log(`按此顺序取前 ${n} 门 = ${credit2.toFixed(2)} 学时:`);
       log(`  纯播放 ${(sec / 60).toFixed(0)} 分钟 + 换课开销 ${overhead.toFixed(0)} 分钟 ≈ ${(sec / 60 + overhead).toFixed(0)} 分钟`);
       log(`  (站点每天上限 5 学时,所以一天就是这个量;视频必须 1 倍速真实播放,无法压缩)`);
+      log('LEARNING_STOP_REASON=completed');
       return;
     }
 
     let round = 0;
-    let dailyLimitHit = false;
+    let stopReason = 'completed';
+
     let noGainStreak = 0;            // 连续几门课没拿到学时(兜底:防每日上限空转)
     const skipThisRun = new Set();   // 本次运行内跳过(可重试的失败),不写进 state
     while (true) {
@@ -1297,6 +1401,7 @@ async function main() {
         break;
       }
       if (cfg.maxCoursesPerRun && round >= cfg.maxCoursesPerRun) {
+        if (skipThisRun.size) stopReason = 'retryable-failure';
         log(`\n已达到本次运行上限 ${cfg.maxCoursesPerRun} 门,结束。`);
         break;
       }
@@ -1309,6 +1414,7 @@ async function main() {
         if (!course) { log(`✖ 未找到课程 ID ${cfg.only}`); break; }
         if (skipThisRun.has(course.id)) {
           log(`  --only 课程 ${cfg.only} 本次尝试未成功,不再重复尝试`);
+          stopReason = 'retryable-failure';
           break;
         }
       } else {
@@ -1337,7 +1443,12 @@ async function main() {
                 || (a.remain - b.remain))
             : ((a, b) => (b.rate - a.rate) || (b.course.required - a.course.required) || (a.remain - b.remain)));
         if (!pending.length) {
-          log('\n没有需要继续学习的视频课程了。');
+          if (skipThisRun.size) {
+            stopReason = 'retryable-failure';
+            log('\n其余课程本次尝试未成功,保留后续重试资格。');
+          } else {
+            log('\n没有需要继续学习的视频课程了。');
+          }
           break;
         }
         course = pending[0].course;
@@ -1374,7 +1485,7 @@ async function main() {
           // 站点有每日学时上限,达到后会返回这条提示。此时再选课/播放都没用,
           // 滑块也会失效,所以直接结束本次运行。
           if (/今天已累计学习|明天再继续|劳逸结合/.test(msg)) {
-            dailyLimitHit = true;
+            stopReason = 'daily-limit';
             log('');
             log('  ╔══════════════════════════════════════════════════════╗');
             log('  ║  🛑 已达站点【每日学时上限】                          ║');
@@ -1401,20 +1512,20 @@ async function main() {
 
       // 2) 播放到结束
       const before = (await safeMyCourses(page, '播放前')).map.get(course.id);
-      const res = await playCourse(browser, cfg, course, page);
+      const res = await playCourse(browser, { ...cfg, playbackRecovery: ['slow-playback', 'stalled-watchdog'].includes(state.courses[course.id]?.reason) }, course, page);
       state.courses[course.id] = {
         name: course.name, credit: course.credit, at: new Date().toISOString(),
         ok: res.ok, reason: res.reason || '', duration: res.duration || 0,
       };
       if (!res.ok) {
-        if (res.blocked) {
+        if (res.blocked || res.manualRequired || res.reason === 'gate-failed') {
           log('');
           log('  ╔══════════════════════════════════════════════════════╗');
-          log('  ║  🛑 播放页拒绝拖拽验证 —— 多半是已达【每日学时上限】  ║');
-          log('  ║  停止本次运行,请明天再试。                           ║');
+          log('  ║  🛑 验证或随堂答题需要人工处理,停止本次运行          ║');
+          log('  ║  请检查浏览器提示后手动重试。                       ║');
           log('  ╚══════════════════════════════════════════════════════╝');
           log('');
-          dailyLimitHit = true;
+          stopReason = 'manual-required';
         }
         if (res.retryable) {
           // 可重试的失败(如验证没过/时长没读到): 本次运行跳过,但不写死,下次还会再试
@@ -1427,6 +1538,12 @@ async function main() {
       }
       saveState(state);
       // 关掉播放窗口后给站点留出释放"单课程锁"的时间
+      if (stopReason === 'manual-required') break;
+      if (res.restartRequired) {
+        stopReason = 'retryable-failure';
+        log('  当前账号因持续卡顿退出，关闭自身浏览器后由原批次监控按授权限次补启。');
+        break;
+      }
       await sleep(11000);
 
       // 3) 复核:该课程的浏览进度是否到 100
@@ -1447,23 +1564,31 @@ async function main() {
         log('  ⚠ 该课程暂未出现在个人学习统计中');
       }
 
+      if (res.ok && (!after || !Number.isFinite(after.browseScore) || after.browseScore < 100)) {
+        // 复核不确定时不重选同课,也不能把它累计为成功播放但无增量。
+        res.ok = false;
+        res.reason = after && Number.isFinite(after.browseScore) ? 'progress-incomplete' : 'progress-unknown';
+        res.retryable = true;
+        skipThisRun.add(course.id);
+        Object.assign(state.courses[course.id], { ok: false, failed: false, retryable: true, reason: res.reason, incomplete: true });
+        saveState(state);
+      }
+
       const creditBefore = credit.value;
       credit = await getCredit(page);
       log(`  当前学时/学分: ${credit.value} (来源 ${credit.source})`);
-      if (cfg.only) { log('  --only 模式:处理完毕,结束。'); break; }
+      if (cfg.only) {
+        if (!res.ok) stopReason = 'retryable-failure';
+        log('  --only 模式:处理完毕,结束。');
+        break;
+      }
 
-      // 兜底:连续 2 门课学时都没涨,多半是撞上每日上限(已选课不会返回那条提示,
-      // 只能靠这个判断),继续跑只会空转。
+      // 只有已确认完成且学时可读的课程才累计无增量;停止是保护措施,不是日限额证据。
       noGainStreak = nextNoGainStreak(noGainStreak, res, creditBefore, credit.value);
-      if (dailyLimitHit || noGainStreak >= 2) {
-        if (!dailyLimitHit) {
-          log('');
-          log('  ╔══════════════════════════════════════════════════════╗');
-          log('  ║  🛑 连续 2 门课都没有新增学时,疑似已达每日上限        ║');
-          log('  ║  停止本次运行,请明天再试。                           ║');
-          log('  ╚══════════════════════════════════════════════════════╝');
-          log('');
-        }
+      if (noGainStreak >= 2) {
+        stopReason = 'no-gain';
+        log('');
+        log('  🛑 连续 2 门课都没有新增学时,保护性停止,请检查站点状态后手动重试。');
         break;
       }
     }
@@ -1471,6 +1596,8 @@ async function main() {
     log('\n══════════════════════════════════════════════════════');
     log(` 结束。本次处理 ${round} 门,学时/学分 ${credit.value}`);
     log('══════════════════════════════════════════════════════');
+    if (stopReason === 'retryable-failure') process.exitCode = 1;
+    log(`LEARNING_STOP_REASON=${stopReason}`);
 
   } catch (e) {
     log('✖ 运行出错: ' + (e && e.stack ? e.stack : e));
@@ -1495,4 +1622,4 @@ if (isDirectRun) {
   main();
 }
 
-export { fetchMyCourses, playCourse, solveLoginCaptchaWithOcr, main };
+export { fetchMyCourses, playCourse, solveLoginCaptchaWithOcr, main, createPlaybackMonitor, reloadPlaybackMedia };

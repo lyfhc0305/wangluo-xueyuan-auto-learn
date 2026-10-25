@@ -14,7 +14,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 
 const target = process.argv[2] || '.';
 const abs = path.resolve(target);
@@ -22,7 +22,7 @@ const abs = path.resolve(target);
 const HIGH = [], MED = [], INFO = [];
 
 const DETECTORS = [
-  { name: 'Windows 路径中的用户名', re: /[A-Za-z]:\\Users\\[^\\\s"'`)]+/g, level: 'HIGH' },
+  { name: 'Windows 路径中的用户名', re: /[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s"'`)]+/g, level: 'HIGH' },
   { name: 'macOS/Linux 用户目录', re: /\/(?:Users|home)\/[^\s"'`)/]+/g, level: 'HIGH' },
   { name: '邮箱地址', re: /[\w.+-]+@[\w-]+\.[A-Za-z]{2,}/g, level: 'HIGH' },
   { name: '中国大陆手机号', re: /(?<!\d)1[3-9]\d{9}(?!\d)/g, level: 'HIGH' },
@@ -35,14 +35,16 @@ const DETECTORS = [
 ];
 
 const TEXT_EXT = /\.(mjs|cjs|js|json|md|txt|bat|cmd|sh|ps1|yml|yaml|html|css)$/i;
-const CREDENTIAL_FILE = /^(?:config(?:\.[^.]+)?|accounts(?:\.local)?)\.json$/i;
+const CREDENTIAL_FILE = /^(?:config|accounts)(?:\.[^.]+)?\.json$/i;
 
-function credentialFields(value, prefix = '') {
+function credentialFields(value, prefix = '', allowMaskedExample = false) {
   if (!value || typeof value !== 'object') return [];
   return Object.entries(value).flatMap(([key, item]) => {
     const field = prefix ? `${prefix}.${key}` : key;
-    if (/^(?:user(?:name)?|account|pass(?:word)?)$/i.test(key) && item != null && String(item).trim() !== '') return [field];
-    return credentialFields(item, field);
+    const maskedExampleUser = allowMaskedExample && /^(?:user(?:name)?|account)$/i.test(key)
+      && typeof item === 'string' && /^1[3-9]\d[xX＊*]{8}$/.test(item);
+    if (/^(?:user(?:name)?|account|pass(?:word)?)$/i.test(key) && item != null && String(item).trim() !== '' && !maskedExampleUser) return [field];
+    return credentialFields(item, field, allowMaskedExample);
   });
 }
 // 跳过这些目录:
@@ -51,7 +53,7 @@ function credentialFields(value, prefix = '') {
 //                                    和资源文件(WasmTtsEngine 的语音包、ZxcvbnData
 //                                    的弱密码字典等),它们自带示例手机号/身份证号,
 //                                    扫了会误报。这个目录单独作为"提醒"列出。
-const SKIP_DIRS = /(^|[\\/])(node_modules|\.git|_recon|test|\.chrome-profile[^\\/]*)([\\/]|$)/;
+const SKIP_DIRS = /(^|[\\/])(node_modules|\.git|_recon|\.chrome-profile[^\\/]*)([\\/]|$)/;
 
 function walk(dir, files = [], dirs = []) {
   for (const d of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -96,7 +98,7 @@ if (!fs.existsSync(abs)) {
     const text = fs.readFileSync(f, 'utf8');
     if (CREDENTIAL_FILE.test(path.basename(f))) {
       try {
-        const fields = credentialFields(JSON.parse(text.replace(/^\uFEFF/, '')));
+        const fields = credentialFields(JSON.parse(text.replace(/^\uFEFF/, '')), '', /^(?:config|accounts)\.example\.json$/i.test(path.basename(f)));
         if (fields.length) {
           HIGH.push([rel, `非空账号/密码字段: ${fields.join(', ')}(值已隐藏)`]);
           continue; // 不把凭据再次通过手机号等检测器打印到报告。
@@ -109,13 +111,13 @@ if (!fs.existsSync(abs)) {
     for (const d of DETECTORS) {
       const hits = [...new Set([...text.matchAll(d.re)].map(m => m[0]))];
       if (hits.length) {
-        (d.level === 'HIGH' ? HIGH : MED).push([rel, `${d.name}: ${hits.slice(0, 3).join(' | ')}`]);
+        (d.level === 'HIGH' ? HIGH : MED).push([rel, `${d.name}: ${hits.length} 处命中(值已隐藏)`]);
       }
     }
   }
 
-  // 文件名 / 目录名也可能泄漏隐私(如 state-13800000000.json、run-13800000000-*.log、
-  // .chrome-profile-13800000000),内容扫描覆盖不到这一层,单独过一遍探测器。
+  // 文件名 / 目录名也可能泄漏隐私(如 state-<profile-key>.json、run-<profile-key>-*.log、
+  // .chrome-profile-<profile-key>),内容扫描覆盖不到这一层,单独过一遍探测器。
   let nameHits = 0;
   for (const p of [...dirs, ...files]) {
     const rel = path.relative(abs, p);
@@ -123,7 +125,7 @@ if (!fs.existsSync(abs)) {
     for (const d of DETECTORS) {
       const hits = [...new Set([...rel.matchAll(d.re)].map(m => m[0]))];
       if (hits.length) {
-        (d.level === 'HIGH' ? HIGH : MED).push([rel, `名称含${d.name}(改名或删除): ${hits.slice(0, 3).join(' | ')}`]);
+        (d.level === 'HIGH' ? HIGH : MED).push([rel, `名称含${d.name}(改名或删除): ${hits.length} 处命中(值已隐藏)`]);
         nameHits++;
         break;   // 同一路径报最相关的一条即可
       }
@@ -151,8 +153,10 @@ if (!fs.existsSync(abs)) {
   // NTFS 备用数据流
   if (process.platform === 'win32') {
     try {
-      const ads = execSync(`powershell -NoProfile -Command "Get-ChildItem -Path '${abs}' -Recurse -File | ForEach-Object { Get-Item $_.FullName -Stream * | Where-Object { $_.Stream -ne ':$DATA' } | Select-Object -ExpandProperty Stream }"`,
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      // Keep the script constant: the untrusted path is data, never PowerShell source.
+      const script = "$ErrorActionPreference = 'Stop'; Get-ChildItem -LiteralPath $env:WLXY_PRIVACY_SCAN_ROOT -Recurse -File | ForEach-Object { Get-Item -LiteralPath $_.FullName -Stream * | Where-Object { $_.Stream -ne ':$DATA' } | Select-Object -ExpandProperty Stream }";
+      const ads = execFileSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true, timeout: 15000, env: { ...process.env, WLXY_PRIVACY_SCAN_ROOT: abs } }).trim();
       if (ads) MED.push(['NTFS', '备用数据流: ' + ads]);
     } catch { /* 忽略 */ }
   }
